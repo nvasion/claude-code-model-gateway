@@ -24,6 +24,22 @@ Thumbs.db
 # Build artifacts
 dist/
 build/
+*.egg-info/
+src/*.egg-info/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+venv/
+.venv/
+*.egg
 
 # Logs
 *.log
+
+# Service runtime (not tracked)
+*.pid

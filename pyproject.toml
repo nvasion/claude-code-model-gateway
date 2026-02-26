@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "claude-code-model-gateway"
 version = "0.1.0"
-description = "A command-line application"
+description = "An HTTP model gateway/proxy service with multi-provider AI backend support"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
@@ -15,14 +15,20 @@ authors = [
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
+    "Environment :: No Input/Output (Daemon)",
     "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
     "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Topic :: Internet :: Proxy Servers",
+    "Topic :: System :: Networking",
 ]
 dependencies = [
     "click>=8.1.0",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -31,13 +37,30 @@ dev = [
     "pytest-cov>=4.0.0",
     "black>=23.0.0",
     "ruff>=0.1.0",
+    "build>=1.0.0",
 ]
 
 [project.scripts]
 claude-code-model-gateway = "src.cli:main"
+claude-code-model-gateway-service = "src.service:main"
+
+[project.urls]
+Homepage = "https://github.com/anthropic/claude-code-model-gateway"
+Documentation = "https://github.com/anthropic/claude-code-model-gateway#readme"
+Repository = "https://github.com/anthropic/claude-code-model-gateway"
+Issues = "https://github.com/anthropic/claude-code-model-gateway/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
+
+[tool.setuptools.package-data]
+"*" = [
+    "service/systemd/*.service",
+    "service/systemd/*.tmpfiles",
+    "service/systemd/*.sysusers",
+    "service/initd/*",
+    "service/conf/*",
+]
 
 [tool.black]
 line-length = 88
