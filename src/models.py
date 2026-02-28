@@ -146,11 +146,17 @@ class ProviderConfig:
     def from_dict(cls, data: dict[str, Any]) -> ProviderConfig:
         """Deserialize from dictionary."""
         models = {}
-        for name, model_data in data.get("models", {}).items():
-            if isinstance(model_data, dict):
-                if "name" not in model_data:
-                    model_data["name"] = name
-                models[name] = ModelConfig.from_dict(model_data)
+        raw_models = data.get("models", {})
+        if isinstance(raw_models, list):
+            for model_data in raw_models:
+                if isinstance(model_data, dict) and "name" in model_data:
+                    models[model_data["name"]] = ModelConfig.from_dict(model_data)
+        else:
+            for name, model_data in raw_models.items():
+                if isinstance(model_data, dict):
+                    if "name" not in model_data:
+                        model_data["name"] = name
+                    models[name] = ModelConfig.from_dict(model_data)
 
         auth_type_val = data.get("auth_type", "api_key")
         try:
@@ -266,11 +272,17 @@ class GatewayConfig:
     def from_dict(cls, data: dict[str, Any]) -> GatewayConfig:
         """Deserialize from dictionary."""
         providers = {}
-        for name, provider_data in data.get("providers", {}).items():
-            if isinstance(provider_data, dict):
-                if "name" not in provider_data:
-                    provider_data["name"] = name
-                providers[name] = ProviderConfig.from_dict(provider_data)
+        raw_providers = data.get("providers", {})
+        if isinstance(raw_providers, list):
+            for provider_data in raw_providers:
+                if isinstance(provider_data, dict) and "name" in provider_data:
+                    providers[provider_data["name"]] = ProviderConfig.from_dict(provider_data)
+        else:
+            for name, provider_data in raw_providers.items():
+                if isinstance(provider_data, dict):
+                    if "name" not in provider_data:
+                        provider_data["name"] = name
+                    providers[name] = ProviderConfig.from_dict(provider_data)
 
         return cls(
             default_provider=data.get("default_provider", ""),
