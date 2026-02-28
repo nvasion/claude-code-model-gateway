@@ -6,5 +6,13 @@
   "factory_version": "latest",
   "owner_id": "ea0c552a-7854-44bb-ad3b-e26b9a9f6781",
   "created_at": "2026-02-25T19:28:22.669746408Z",
-  "updated_at": "2026-02-28T00:21:32.792832836Z"
+  "updated_at": "2026-02-28T00:21:39.339133357Z",
+  "git": {
+    "connected": true,
+    "remote_url": "https://github.com/nvasion/claude-code-model-gateway.git",
+    "branch": "worktree-agent-a3f9aa07",
+    "repo_name": "claude-code-model-gateway",
+    "repo_owner": "nvasion",
+    "connected_at": "2026-02-28T00:21:39.339076602Z"
+  }
 }
