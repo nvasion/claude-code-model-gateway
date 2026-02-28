@@ -1,0 +1,48 @@
+# ===========================================================================
+# docker-compose.yaml — claude-code-model-gateway
+# ===========================================================================
+# Usage:
+#   docker compose up -d
+#   docker compose logs -f gateway
+#   docker compose down
+# ===========================================================================
+
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: claude-code-model-gateway
+    restart: unless-stopped
+    ports:
+      - "${GATEWAY_PORT:-8080}:8080"
+    environment:
+      - GATEWAY_HOST=0.0.0.0
+      - GATEWAY_PORT=8080
+      - GATEWAY_TIMEOUT=${GATEWAY_TIMEOUT:-300}
+      - GATEWAY_LOG_FORMAT=${GATEWAY_LOG_FORMAT:-json}
+      - GATEWAY_LOG_LEVEL=${GATEWAY_LOG_LEVEL:-info}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+    volumes:
+      - gateway-logs:/var/log/claude-code-model-gateway
+      - gateway-data:/var/lib/claude-code-model-gateway
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; s=socket.create_connection(('127.0.0.1',8080),5); s.close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+        reservations:
+          memory: 128M
+          cpus: "0.25"
+
+volumes:
+  gateway-logs:
+  gateway-data:
