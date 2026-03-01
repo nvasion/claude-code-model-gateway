@@ -11,6 +11,7 @@ Key features:
 - Configurable retry with exponential backoff for transient failures
 - Configurable timeout and logging
 - Request/response logging for debugging
+- Config-driven mode: serve /v1/models from config, route messages to any provider
 """
 
 import http.client
@@ -24,6 +25,7 @@ import ssl
 import threading
 import time
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 from src.errors import (
     AuthenticationError,
@@ -101,6 +103,10 @@ class AnthropicPassthroughHandler(http.server.BaseHTTPRequestHandler):
     retry_base_delay: float = 1.0
     retry_max_delay: float = 30.0
 
+    # Config-driven mode: when set, /v1/models is served from config and
+    # messages are routed to the configured provider instead of api.anthropic.com
+    gateway_config: Optional[Any] = None  # GatewayConfig | None
+
     def log_message(self, format: str, *args) -> None:
         """Route access logs through the logging module."""
         logger.info("anthropic-passthrough: %s", format % args)
@@ -134,7 +140,7 @@ class AnthropicPassthroughHandler(http.server.BaseHTTPRequestHandler):
     # ------------------------------------------------------------------ #
 
     def _handle_request(self) -> None:
-        """Forward the incoming request to the Anthropic API."""
+        """Forward the incoming request to the appropriate upstream."""
         request_start = time.monotonic()
         # Validate path
         path = self.path.split("?")[0]  # Strip query string for validation
@@ -154,23 +160,88 @@ class AnthropicPassthroughHandler(http.server.BaseHTTPRequestHandler):
             )
             return
 
-        # Get API key
-        api_key = self._get_api_key()
-        if not api_key:
-            self._send_error(
-                401,
-                {
-                    "type": "error",
-                    "error": {
-                        "type": "authentication_error",
-                        "message": (
-                            "No API key configured. Set the ANTHROPIC_API_KEY "
-                            "environment variable or pass --api-key to the gateway."
-                        ),
-                    },
-                },
-            )
+        # In config-driven mode, serve /v1/models locally from the config file.
+        # This allows non-Anthropic providers (OpenRouter, etc.) to appear in
+        # the Claude Code /model picker without forwarding to api.anthropic.com.
+        if path == "/v1/models" and self.gateway_config is not None:
+            self._serve_models_from_config()
             return
+
+        # Determine upstream connection params and auth headers.
+        # When a gateway config with a valid provider is present, use that
+        # provider's api_base and credentials; otherwise fall through to the
+        # default Anthropic pass-through behaviour.
+        upstream_host: str = self.anthropic_api_host
+        upstream_port: int = self.anthropic_api_port
+        upstream_https: bool = self.use_https
+        upstream_path: str = self.path
+        upstream_headers: dict[str, str]
+
+        if self.gateway_config is not None:
+            provider = self.gateway_config.get_provider()
+            if provider and provider.api_base:
+                parsed = self._parse_api_base(provider.api_base)
+                if parsed is None:
+                    self._send_error(
+                        500,
+                        {
+                            "type": "error",
+                            "error": {
+                                "type": "api_error",
+                                "message": (
+                                    f"Invalid api_base '{provider.api_base}' "
+                                    f"for provider '{provider.name}'"
+                                ),
+                            },
+                        },
+                    )
+                    return
+                upstream_host, upstream_port, upstream_https, base_path = parsed
+                upstream_path = self._compute_forwarded_path(self.path, base_path)
+                api_key = ""
+                if provider.api_key_env_var:
+                    api_key = os.environ.get(provider.api_key_env_var, "")
+                upstream_headers = self._build_provider_upstream_headers(
+                    provider, upstream_host, api_key
+                )
+            else:
+                # Config present but no provider — fall back to Anthropic defaults
+                api_key = self._get_api_key()
+                if not api_key:
+                    self._send_error(
+                        401,
+                        {
+                            "type": "error",
+                            "error": {
+                                "type": "authentication_error",
+                                "message": (
+                                    "No API key configured. Set the ANTHROPIC_API_KEY "
+                                    "environment variable or pass --api-key to the gateway."
+                                ),
+                            },
+                        },
+                    )
+                    return
+                upstream_headers = self._build_upstream_headers(api_key)
+        else:
+            # No config: default Anthropic pass-through
+            api_key = self._get_api_key()
+            if not api_key:
+                self._send_error(
+                    401,
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "authentication_error",
+                            "message": (
+                                "No API key configured. Set the ANTHROPIC_API_KEY "
+                                "environment variable or pass --api-key to the gateway."
+                            ),
+                        },
+                    },
+                )
+                return
+            upstream_headers = self._build_upstream_headers(api_key)
 
         # Read request body
         content_length = int(self.headers.get("Content-Length", 0))
@@ -185,9 +256,6 @@ class AnthropicPassthroughHandler(http.server.BaseHTTPRequestHandler):
             except (json.JSONDecodeError, AttributeError):
                 pass
 
-        # Build upstream headers
-        upstream_headers = self._build_upstream_headers(api_key)
-
         # Add Content-Type and Content-Length for body requests
         if body is not None:
             upstream_headers["Content-Type"] = (
@@ -196,20 +264,37 @@ class AnthropicPassthroughHandler(http.server.BaseHTTPRequestHandler):
             upstream_headers["Content-Length"] = str(len(body))
 
         logger.info(
-            "Forwarding %s %s to %s (streaming=%s)",
+            "Forwarding %s %s to %s%s (streaming=%s)",
             self.command,
             self.path,
-            self.anthropic_api_host,
+            upstream_host,
+            upstream_path,
             is_streaming,
         )
 
         if is_streaming:
             # Streaming requests are NOT retried — partial data may
             # have been sent to the client already.
-            self._forward_streaming(body, upstream_headers, request_start)
+            self._forward_streaming(
+                body,
+                upstream_headers,
+                request_start,
+                upstream_host,
+                upstream_port,
+                upstream_https,
+                upstream_path,
+            )
         else:
             # Non-streaming requests use retry logic
-            self._forward_with_retry(body, upstream_headers, request_start)
+            self._forward_with_retry(
+                body,
+                upstream_headers,
+                request_start,
+                upstream_host,
+                upstream_port,
+                upstream_https,
+                upstream_path,
+            )
 
     # ------------------------------------------------------------------ #
     # Non-streaming with retry
@@ -220,8 +305,18 @@ class AnthropicPassthroughHandler(http.server.BaseHTTPRequestHandler):
         body: Optional[bytes],
         upstream_headers: dict[str, str],
         request_start: float,
+        upstream_host: Optional[str] = None,
+        upstream_port: Optional[int] = None,
+        upstream_https: Optional[bool] = None,
+        upstream_path: Optional[str] = None,
     ) -> None:
         """Forward a non-streaming request with retry on transient failure."""
+        # Resolve upstream connection params (use class defaults when not given)
+        host = upstream_host if upstream_host is not None else self.anthropic_api_host
+        port = upstream_port if upstream_port is not None else self.anthropic_api_port
+        use_https = upstream_https if upstream_https is not None else self.use_https
+        path = upstream_path if upstream_path is not None else self.path
+
         total_attempts = self.max_retries + 1
         retry_config = RetryConfig(
             max_attempts=total_attempts,
@@ -243,24 +338,24 @@ class AnthropicPassthroughHandler(http.server.BaseHTTPRequestHandler):
                 ProviderError on retryable HTTP status codes.
             """
             try:
-                if self.use_https:
+                if use_https:
                     context = ssl.create_default_context()
                     conn = http.client.HTTPSConnection(
-                        self.anthropic_api_host,
-                        self.anthropic_api_port,
+                        host,
+                        port,
                         timeout=self.upstream_timeout,
                         context=context,
                     )
                 else:
                     conn = http.client.HTTPConnection(
-                        self.anthropic_api_host,
-                        self.anthropic_api_port,
+                        host,
+                        port,
                         timeout=self.upstream_timeout,
                     )
 
                 conn.request(
                     self.command,
-                    self.path,
+                    path,
                     body=body,
                     headers=upstream_headers,
                 )
@@ -286,16 +381,16 @@ class AnthropicPassthroughHandler(http.server.BaseHTTPRequestHandler):
 
                     if resp_status == 429:
                         raise RateLimitError(
-                            f"Anthropic API rate limit (HTTP {resp_status})",
+                            f"Upstream rate limit (HTTP {resp_status})",
                             retry_after=retry_after,
-                            provider="anthropic",
+                            provider=host,
                             status_code=resp_status,
                         )
 
                     raise ProviderError(
-                        f"Anthropic API returned {resp_status} {resp_reason}",
+                        f"Upstream returned {resp_status} {resp_reason}",
                         status_code=resp_status,
-                        provider="anthropic",
+                        provider=host,
                         response_body=resp_body.decode("utf-8", errors="replace"),
                     )
 
@@ -312,37 +407,37 @@ class AnthropicPassthroughHandler(http.server.BaseHTTPRequestHandler):
                 raise  # Already structured — propagate for retry
             except ssl.SSLError as exc:
                 raise GatewaySSLError(
-                    f"SSL error connecting to Anthropic API: {exc}",
-                    host=self.anthropic_api_host,
-                    port=self.anthropic_api_port,
+                    f"SSL error connecting to {host}: {exc}",
+                    host=host,
+                    port=port,
                     cause=exc,
                 )
             except (socket.timeout, TimeoutError) as exc:
                 raise GatewayTimeoutError(
                     self.upstream_timeout,
-                    host=self.anthropic_api_host,
-                    port=self.anthropic_api_port,
+                    host=host,
+                    port=port,
                     cause=exc,
                 )
             except ConnectionRefusedError as exc:
                 raise NetworkError(
-                    f"Connection refused by {self.anthropic_api_host}:{self.anthropic_api_port}",
-                    host=self.anthropic_api_host,
-                    port=self.anthropic_api_port,
+                    f"Connection refused by {host}:{port}",
+                    host=host,
+                    port=port,
                     cause=exc,
                 )
             except (ConnectionError, OSError) as exc:
                 raise NetworkError(
                     f"Connection error: {exc}",
-                    host=self.anthropic_api_host,
-                    port=self.anthropic_api_port,
+                    host=host,
+                    port=port,
                     cause=exc,
                 )
             except Exception as exc:
                 raise BadGatewayError(
-                    f"Error connecting to Anthropic API: {exc}",
-                    host=self.anthropic_api_host,
-                    port=self.anthropic_api_port,
+                    f"Error connecting to {host}: {exc}",
+                    host=host,
+                    port=port,
                     cause=exc,
                 )
 
@@ -374,7 +469,7 @@ class AnthropicPassthroughHandler(http.server.BaseHTTPRequestHandler):
                 duration_ms=duration_ms,
                 client_ip=client_addr,
                 extra={
-                    "upstream": self.anthropic_api_host,
+                    "upstream": host,
                     "streaming": False,
                 },
                 logger=logger,
@@ -392,7 +487,7 @@ class AnthropicPassthroughHandler(http.server.BaseHTTPRequestHandler):
                     "type": "error",
                     "error": {
                         "type": "api_error",
-                        "message": f"Error connecting to Anthropic API: {exc}",
+                        "message": f"Error connecting to upstream: {exc}",
                     },
                 },
             )
@@ -406,27 +501,37 @@ class AnthropicPassthroughHandler(http.server.BaseHTTPRequestHandler):
         body: Optional[bytes],
         upstream_headers: dict[str, str],
         request_start: float,
+        upstream_host: Optional[str] = None,
+        upstream_port: Optional[int] = None,
+        upstream_https: Optional[bool] = None,
+        upstream_path: Optional[str] = None,
     ) -> None:
         """Forward a streaming request without retries."""
+        # Resolve upstream connection params (use class defaults when not given)
+        host = upstream_host if upstream_host is not None else self.anthropic_api_host
+        port = upstream_port if upstream_port is not None else self.anthropic_api_port
+        use_https = upstream_https if upstream_https is not None else self.use_https
+        path = upstream_path if upstream_path is not None else self.path
+
         try:
-            if self.use_https:
+            if use_https:
                 context = ssl.create_default_context()
                 conn = http.client.HTTPSConnection(
-                    self.anthropic_api_host,
-                    self.anthropic_api_port,
+                    host,
+                    port,
                     timeout=self.upstream_timeout,
                     context=context,
                 )
             else:
                 conn = http.client.HTTPConnection(
-                    self.anthropic_api_host,
-                    self.anthropic_api_port,
+                    host,
+                    port,
                     timeout=self.upstream_timeout,
                 )
 
             conn.request(
                 self.command,
-                self.path,
+                path,
                 body=body,
                 headers=upstream_headers,
             )
@@ -444,26 +549,26 @@ class AnthropicPassthroughHandler(http.server.BaseHTTPRequestHandler):
                 duration_ms=duration_ms,
                 client_ip=client_addr,
                 extra={
-                    "upstream": self.anthropic_api_host,
+                    "upstream": host,
                     "streaming": True,
                 },
                 logger=logger,
             )
 
         except ssl.SSLError as exc:
-            logger.error("SSL error connecting to Anthropic API: %s", exc)
+            logger.error("SSL error connecting to %s: %s", host, exc)
             self._send_error(
                 502,
                 {
                     "type": "error",
                     "error": {
                         "type": "api_error",
-                        "message": f"SSL error connecting to Anthropic API: {exc}",
+                        "message": f"SSL error connecting to {host}: {exc}",
                     },
                 },
             )
         except TimeoutError as exc:
-            logger.error("Timeout connecting to Anthropic API: %s", exc)
+            logger.error("Timeout connecting to %s: %s", host, exc)
             self._send_error(
                 504,
                 {
@@ -471,7 +576,7 @@ class AnthropicPassthroughHandler(http.server.BaseHTTPRequestHandler):
                     "error": {
                         "type": "timeout_error",
                         "message": (
-                            f"Request to Anthropic API timed out after "
+                            f"Request to {host} timed out after "
                             f"{self.upstream_timeout}s"
                         ),
                     },
@@ -487,7 +592,7 @@ class AnthropicPassthroughHandler(http.server.BaseHTTPRequestHandler):
                     "type": "error",
                     "error": {
                         "type": "api_error",
-                        "message": f"Error connecting to Anthropic API: {exc}",
+                        "message": f"Error connecting to upstream: {exc}",
                     },
                 },
             )
@@ -605,6 +710,151 @@ class AnthropicPassthroughHandler(http.server.BaseHTTPRequestHandler):
                 },
             },
         )
+
+    # ------------------------------------------------------------------ #
+    # Config-driven helpers
+    # ------------------------------------------------------------------ #
+
+    def _serve_models_from_config(self) -> None:
+        """Serve GET /v1/models from the gateway config.
+
+        Returns all models across all enabled providers in the Anthropic
+        models list format so Claude Code can populate its /model picker.
+        """
+        models_data = []
+        for provider in self.gateway_config.get_enabled_providers().values():
+            for model in provider.models.values():
+                models_data.append(
+                    {
+                        "type": "model",
+                        "id": model.name,
+                        "display_name": model.display_name,
+                        "created_at": "2024-01-01T00:00:00Z",
+                    }
+                )
+
+        response: dict[str, Any] = {
+            "data": models_data,
+            "has_more": False,
+        }
+        if models_data:
+            response["first_id"] = models_data[0]["id"]
+            response["last_id"] = models_data[-1]["id"]
+
+        body = json.dumps(response).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+        logger.info("Served %d model(s) from gateway config", len(models_data))
+
+    def _parse_api_base(
+        self, api_base: str
+    ) -> Optional[tuple[str, int, bool, str]]:
+        """Parse a provider api_base URL into (host, port, use_https, base_path).
+
+        Args:
+            api_base: Full URL such as ``https://openrouter.ai/api/v1``.
+
+        Returns:
+            ``(host, port, use_https, base_path)`` tuple, or ``None`` if the
+            URL cannot be parsed or has no hostname.
+        """
+        try:
+            parsed = urlparse(api_base)
+            host = parsed.hostname
+            if not host:
+                return None
+            use_https = parsed.scheme == "https"
+            port = parsed.port or (443 if use_https else 80)
+            base_path = parsed.path.rstrip("/")
+            return host, port, use_https, base_path
+        except Exception:
+            return None
+
+    def _compute_forwarded_path(self, request_path: str, base_path: str) -> str:
+        """Compute the upstream path from the incoming request path.
+
+        Strips the ``/v1`` prefix from *request_path* and prepends
+        *base_path* so that, for example::
+
+            request_path="/v1/messages", base_path="/api/v1"
+            → "/api/v1/messages"
+
+        Args:
+            request_path: The full incoming path including query string
+                (e.g. ``/v1/messages?foo=bar``).
+            base_path: The api_base path component (e.g. ``/api/v1``).
+
+        Returns:
+            The path string to send to the upstream server.
+        """
+        # Separate query string
+        if "?" in request_path:
+            path_part, query = request_path.split("?", 1)
+            query = "?" + query
+        else:
+            path_part, query = request_path, ""
+
+        # Strip the leading /v1 segment
+        if path_part.startswith("/v1/"):
+            endpoint = path_part[4:]  # e.g. "messages" or "models"
+        elif path_part == "/v1":
+            endpoint = ""
+        else:
+            endpoint = path_part.lstrip("/")
+
+        if endpoint:
+            return f"{base_path}/{endpoint}{query}"
+        return f"{base_path}{query}"
+
+    def _build_provider_upstream_headers(
+        self, provider: Any, upstream_host: str, api_key: str
+    ) -> dict[str, str]:
+        """Build upstream headers for a configured provider.
+
+        Applies the correct authentication scheme (bearer token or api-key)
+        and includes any static headers defined in the provider config.
+
+        Args:
+            provider: A ``ProviderConfig`` instance.
+            upstream_host: The upstream hostname (used for the Host header).
+            api_key: The resolved API key string.
+
+        Returns:
+            Dictionary of HTTP headers to send upstream.
+        """
+        from src.models import AuthType
+
+        headers: dict[str, str] = {
+            "Host": upstream_host,
+            "Accept": "application/json",
+        }
+
+        # Apply authentication based on provider auth_type
+        if provider.auth_type == AuthType.BEARER_TOKEN:
+            headers["Authorization"] = f"Bearer {api_key}"
+        elif provider.auth_type == AuthType.API_KEY:
+            headers["x-api-key"] = api_key
+        # AuthType.NONE: no auth header added
+
+        # Merge any static headers defined in the provider config
+        headers.update(provider.headers)
+
+        # Forward select client headers
+        for key, val in self.headers.items():
+            lower_key = key.lower()
+            if lower_key in HOP_BY_HOP_HEADERS:
+                continue
+            if lower_key in MANAGED_HEADERS:
+                continue
+            # Forward user-agent and accept-* headers
+            if lower_key == "user-agent" or lower_key.startswith("accept"):
+                headers[key] = val
+
+        return headers
 
     # ------------------------------------------------------------------ #
     # Helper methods
@@ -726,6 +976,7 @@ def create_passthrough_server(
     max_retries: int = 2,
     retry_base_delay: float = 1.0,
     retry_max_delay: float = 30.0,
+    gateway_config: Optional[Any] = None,
 ) -> ThreadedGatewayServer:
     """Create (but do not start) an Anthropic pass-through server.
 
@@ -744,6 +995,9 @@ def create_passthrough_server(
             (0 = no retries).
         retry_base_delay: Base delay in seconds for retry backoff.
         retry_max_delay: Maximum delay cap in seconds.
+        gateway_config: Optional GatewayConfig. When set, ``GET /v1/models``
+            is served from the config and messages are routed to the
+            default provider instead of api.anthropic.com.
 
     Returns:
         A configured ThreadedGatewayServer instance.
@@ -758,6 +1012,7 @@ def create_passthrough_server(
     handler.max_retries = max_retries
     handler.retry_base_delay = retry_base_delay
     handler.retry_max_delay = retry_max_delay
+    handler.gateway_config = gateway_config
 
     server = ThreadedGatewayServer((host, port), handler)
     return server
@@ -775,6 +1030,7 @@ def run_passthrough(
     max_retries: int = 2,
     retry_base_delay: float = 1.0,
     retry_max_delay: float = 30.0,
+    gateway_config: Optional[Any] = None,
 ) -> None:
     """Start the Anthropic pass-through server and serve requests forever.
 
@@ -790,6 +1046,7 @@ def run_passthrough(
         max_retries: Number of retries for non-streaming requests.
         retry_base_delay: Base delay in seconds for retry backoff.
         retry_max_delay: Maximum delay cap in seconds.
+        gateway_config: Optional GatewayConfig for config-driven mode.
     """
     server = create_passthrough_server(
         host=host,
@@ -803,20 +1060,26 @@ def run_passthrough(
         max_retries=max_retries,
         retry_base_delay=retry_base_delay,
         retry_max_delay=retry_max_delay,
+        gateway_config=gateway_config,
+    )
+    upstream_label = (
+        gateway_config.get_provider().api_base
+        if gateway_config and gateway_config.get_provider()
+        else anthropic_api_host
     )
     logger.info(
-        "Anthropic pass-through server listening on %s:%d "
+        "Gateway listening on %s:%d "
         "(upstream: %s, version: %s, max_retries: %d)",
         host,
         port,
-        anthropic_api_host,
+        upstream_label,
         anthropic_version,
         max_retries,
     )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        logger.info("Shutting down Anthropic pass-through server")
+        logger.info("Shutting down gateway server")
     finally:
         server.server_close()
 
@@ -833,6 +1096,7 @@ def run_passthrough_in_thread(
     max_retries: int = 2,
     retry_base_delay: float = 1.0,
     retry_max_delay: float = 30.0,
+    gateway_config: Optional[Any] = None,
 ) -> tuple[ThreadedGatewayServer, threading.Thread]:
     """Start the Anthropic pass-through server in a background thread.
 
@@ -850,6 +1114,7 @@ def run_passthrough_in_thread(
         max_retries: Number of retries for non-streaming requests.
         retry_base_delay: Base delay in seconds for retry backoff.
         retry_max_delay: Maximum delay cap in seconds.
+        gateway_config: Optional GatewayConfig for config-driven mode.
 
     Returns:
         A (server, thread) tuple. Call server.shutdown() to stop.
@@ -866,11 +1131,12 @@ def run_passthrough_in_thread(
         max_retries=max_retries,
         retry_base_delay=retry_base_delay,
         retry_max_delay=retry_max_delay,
+        gateway_config=gateway_config,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     logger.info(
-        "Anthropic pass-through server started in background on %s:%d",
+        "Gateway server started in background on %s:%d",
         host,
         port,
     )

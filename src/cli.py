@@ -194,6 +194,21 @@ def proxy(
     help="Anthropic API version header value.",
 )
 @click.option(
+    "--config",
+    "-c",
+    "config_file",
+    default=None,
+    envvar="GATEWAY_CONFIG",
+    type=click.Path(exists=True, dir_okay=False),
+    help=(
+        "Path to the gateway config YAML/JSON file. "
+        "When provided, GET /v1/models is served from the config and "
+        "POST /v1/messages is routed to the configured default provider. "
+        "Also auto-detected from gateway.yaml in the current directory or "
+        "the GATEWAY_CONFIG environment variable."
+    ),
+)
+@click.option(
     "--verbose",
     "-v",
     is_flag=True,
@@ -233,17 +248,29 @@ def gateway(
     timeout: int,
     api_key: Optional[str],
     anthropic_version: str,
+    config_file: Optional[str],
     verbose: bool,
     log_format: str,
     log_file: str,
     max_retries: int,
     retry_delay: float,
 ):
-    """Start the Anthropic API pass-through gateway.
+    """Start the model gateway.
 
-    Launches a local HTTP server that acts as a transparent reverse proxy
-    to the Anthropic Messages API. All requests are forwarded directly to
-    api.anthropic.com with proper authentication headers.
+    Launches a local HTTP server that accepts Anthropic-format requests and
+    either forwards them to api.anthropic.com (default) or routes them to the
+    provider configured in a gateway config file.
+
+    With a config file (--config or gateway.yaml in the current directory):
+
+    \b
+      • GET  /v1/models  → served locally from the config (no API call needed)
+      • POST /v1/messages → forwarded to the default provider in the config
+
+    Without a config file:
+
+    \b
+      • All requests are forwarded transparently to api.anthropic.com
 
     Supported endpoints:
 
@@ -252,23 +279,18 @@ def gateway(
       POST /v1/messages/count_tokens - Count tokens
       GET  /v1/models             - List available models
 
-    The gateway reads the API key from --api-key, the client's x-api-key
-    header, or the ANTHROPIC_API_KEY environment variable (in that order).
-
-    Both streaming (SSE) and non-streaming responses are fully supported.
-    Non-streaming requests are automatically retried on transient failures
-    (429, 5xx) with exponential backoff.  Streaming requests are NOT
-    retried because partial SSE data may have already been sent.
-
     Example:
 
     \b
         claude-code-model-gateway gateway
+        claude-code-model-gateway gateway --config gateway.yaml
         claude-code-model-gateway gateway --port 9090
         claude-code-model-gateway gateway --api-key sk-ant-...
         claude-code-model-gateway gateway -v --timeout 600
         claude-code-model-gateway gateway --max-retries 5 --retry-delay 2.0
     """
+    import os
+
     from src.anthropic_passthrough import run_passthrough
 
     log_level = "debug" if verbose else "info"
@@ -282,14 +304,57 @@ def gateway(
 
     logger = get_logger("cli.gateway")
 
-    if not api_key:
-        import os
+    # Load gateway config (explicit path, env var, or auto-detected file)
+    gateway_cfg = None
+    config_path = None
+    if not config_file:
+        # Auto-detect from default paths (gateway.yaml, etc.)
+        from src.config import find_config_file
 
+        detected = find_config_file()
+        if detected:
+            config_file = str(detected)
+
+    if config_file:
+        from pathlib import Path
+
+        from src.config import ConfigError, load_config
+
+        try:
+            gateway_cfg = load_config(path=Path(config_file), validate=False)
+            config_path = config_file
+        except ConfigError as exc:
+            click.echo(f"Warning: could not load config '{config_file}': {exc}", err=True)
+
+    if not api_key:
         api_key = os.environ.get("ANTHROPIC_API_KEY")
 
-    key_source = "provided" if api_key else "not set (will check per-request)"
-    click.echo(f"Starting Anthropic pass-through gateway on {host}:{port}")
-    click.echo(f"  Upstream:  https://api.anthropic.com/v1")
+    # Determine the effective upstream for display purposes
+    if gateway_cfg and gateway_cfg.get_provider():
+        provider = gateway_cfg.get_provider()
+        upstream_display = provider.api_base or "api.anthropic.com/v1"
+        key_source = (
+            f"from ${provider.api_key_env_var}"
+            if provider.api_key_env_var
+            else "not set"
+        )
+    else:
+        upstream_display = "https://api.anthropic.com/v1"
+        key_source = "provided" if api_key else "not set (will check per-request)"
+
+    click.echo(f"Starting model gateway on {host}:{port}")
+    if config_path:
+        click.echo(f"  Config:    {config_path}")
+        if gateway_cfg and gateway_cfg.get_provider():
+            provider = gateway_cfg.get_provider()
+            total_models = sum(
+                len(p.models) for p in gateway_cfg.get_enabled_providers().values()
+            )
+            click.echo(
+                f"  Provider:  {provider.display_name} ({provider.name})"
+                f" — {total_models} model(s)"
+            )
+    click.echo(f"  Upstream:  {upstream_display}")
     click.echo(f"  API key:   {key_source}")
     click.echo(f"  Version:   {anthropic_version}")
     click.echo(f"  Timeout:   {timeout}s")
@@ -309,6 +374,7 @@ def gateway(
         anthropic_version=anthropic_version,
         max_retries=max_retries,
         retry_base_delay=retry_delay,
+        gateway_config=gateway_cfg,
     )
 
 

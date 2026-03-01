@@ -746,13 +746,14 @@ class TestGatewayCLI:
         """The gateway command help text is correct."""
         result = runner.invoke(main, ["gateway", "--help"])
         assert result.exit_code == 0
-        assert "Anthropic API pass-through gateway" in result.output
+        assert "gateway" in result.output.lower()
         assert "--host" in result.output
         assert "--port" in result.output
         assert "--timeout" in result.output
         assert "--api-key" in result.output
         assert "--anthropic-version" in result.output
         assert "--verbose" in result.output
+        assert "--config" in result.output
 
     def test_gateway_appears_in_main_help(self, runner):
         """The gateway command is listed in the main help."""
@@ -796,3 +797,336 @@ class TestModuleConstants:
     def test_handler_default_timeout(self):
         """Handler default timeout is 300 seconds."""
         assert AnthropicPassthroughHandler.upstream_timeout == 300
+
+
+# ------------------------------------------------------------------ #
+# Tests: Config-driven mode (helper unit tests)
+# ------------------------------------------------------------------ #
+
+
+class TestParseApiBase:
+    """Unit tests for _parse_api_base."""
+
+    def _make_handler(self):
+        """Create a bare AnthropicPassthroughHandler for unit testing."""
+        handler = AnthropicPassthroughHandler.__new__(AnthropicPassthroughHandler)
+        return handler
+
+    def test_https_url(self):
+        """Parses an HTTPS URL correctly."""
+        h = self._make_handler()
+        result = h._parse_api_base("https://openrouter.ai/api/v1")
+        assert result is not None
+        host, port, use_https, base_path = result
+        assert host == "openrouter.ai"
+        assert port == 443
+        assert use_https is True
+        assert base_path == "/api/v1"
+
+    def test_http_url(self):
+        """Parses an HTTP URL and sets use_https=False."""
+        h = self._make_handler()
+        result = h._parse_api_base("http://127.0.0.1:9000/v1")
+        assert result is not None
+        host, port, use_https, base_path = result
+        assert host == "127.0.0.1"
+        assert port == 9000
+        assert use_https is False
+        assert base_path == "/v1"
+
+    def test_url_trailing_slash_stripped(self):
+        """Trailing slash in path is stripped."""
+        h = self._make_handler()
+        result = h._parse_api_base("https://example.com/api/v1/")
+        assert result is not None
+        assert result[3] == "/api/v1"
+
+    def test_invalid_url_returns_none(self):
+        """Invalid URL returns None."""
+        h = self._make_handler()
+        assert h._parse_api_base("not-a-url") is None
+
+    def test_url_without_path(self):
+        """URL with no path component returns empty base_path."""
+        h = self._make_handler()
+        result = h._parse_api_base("https://api.example.com")
+        assert result is not None
+        assert result[3] == ""
+
+
+class TestComputeForwardedPath:
+    """Unit tests for _compute_forwarded_path."""
+
+    def _make_handler(self):
+        handler = AnthropicPassthroughHandler.__new__(AnthropicPassthroughHandler)
+        return handler
+
+    def test_messages_with_api_v1_base(self):
+        """/v1/messages → /api/v1/messages when base_path=/api/v1."""
+        h = self._make_handler()
+        assert h._compute_forwarded_path("/v1/messages", "/api/v1") == "/api/v1/messages"
+
+    def test_models_with_api_v1_base(self):
+        """/v1/models → /api/v1/models when base_path=/api/v1."""
+        h = self._make_handler()
+        assert h._compute_forwarded_path("/v1/models", "/api/v1") == "/api/v1/models"
+
+    def test_count_tokens_with_api_v1_base(self):
+        """/v1/messages/count_tokens → /api/v1/messages/count_tokens."""
+        h = self._make_handler()
+        assert (
+            h._compute_forwarded_path("/v1/messages/count_tokens", "/api/v1")
+            == "/api/v1/messages/count_tokens"
+        )
+
+    def test_v1_base_path_is_idempotent(self):
+        """/v1/messages with base_path=/v1 keeps the same logical path."""
+        h = self._make_handler()
+        # /v1 base_path + messages = /v1/messages
+        assert h._compute_forwarded_path("/v1/messages", "/v1") == "/v1/messages"
+
+    def test_query_string_preserved(self):
+        """Query string parameters are preserved."""
+        h = self._make_handler()
+        result = h._compute_forwarded_path("/v1/models?limit=10", "/api/v1")
+        assert result == "/api/v1/models?limit=10"
+
+
+# ------------------------------------------------------------------ #
+# Tests: Config-driven /v1/models endpoint
+# ------------------------------------------------------------------ #
+
+
+class _MockProviderHandler(http.server.BaseHTTPRequestHandler):
+    """Mock OpenRouter-style provider for config-driven tests.
+
+    Expects:
+    - Authorization: Bearer <token>
+    - Requests to /api/v1/messages (not /v1/messages)
+    """
+
+    def log_message(self, format, *args):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length).decode() if length else ""
+        auth = self.headers.get("Authorization", "")
+
+        if not auth.startswith("Bearer "):
+            resp = json.dumps(
+                {"type": "error", "error": {"type": "auth_error", "message": "Missing bearer token"}}
+            ).encode()
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+            return
+
+        # Record which path was called (tests can inspect via class attribute)
+        _MockProviderHandler.last_path = self.path
+        _MockProviderHandler.last_auth = auth
+
+        resp_data = {
+            "id": "msg_provider_test",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Provider response"}],
+            "model": "test-model",
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 5, "output_tokens": 3},
+        }
+        resp = json.dumps(resp_data).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(resp)))
+        self.end_headers()
+        self.wfile.write(resp)
+
+
+_MockProviderHandler.last_path = None
+_MockProviderHandler.last_auth = None
+
+
+def _build_openrouter_config(api_base: str) -> "GatewayConfig":
+    """Build a minimal GatewayConfig that mimics an OpenRouter setup."""
+    from src.models import AuthType, GatewayConfig, ModelConfig, ProviderConfig
+
+    model_a = ModelConfig(
+        name="arcee-ai/trinity-large-preview:free",
+        display_name="Arcee AI: Trinity Large Preview (free)",
+        max_tokens=8192,
+        supports_streaming=True,
+        supports_tools=True,
+    )
+    model_b = ModelConfig(
+        name="google/gemma-3-27b-it:free",
+        display_name="Google: Gemma 3 27B (free)",
+        max_tokens=8192,
+        supports_streaming=True,
+        supports_tools=True,
+    )
+    provider = ProviderConfig(
+        name="openrouter",
+        display_name="OpenRouter",
+        api_base=api_base,
+        api_key_env_var="OPENROUTER_API_KEY",
+        auth_type=AuthType.BEARER_TOKEN,
+        models={"arcee-ai/trinity-large-preview:free": model_a, "google/gemma-3-27b-it:free": model_b},
+    )
+    return GatewayConfig(default_provider="openrouter", providers={"openrouter": provider})
+
+
+# Import GatewayConfig for type hint usage in helpers above
+from src.models import GatewayConfig  # noqa: E402
+
+
+class TestConfigDrivenModels:
+    """Tests for /v1/models served from gateway config."""
+
+    @pytest.fixture(scope="class")
+    def config_gateway(self):
+        """Gateway with a config that has two OpenRouter models."""
+        config = _build_openrouter_config("http://127.0.0.1:1")  # dummy URL, models are local
+        server, thread = run_passthrough_in_thread(
+            host="127.0.0.1",
+            port=0,
+            gateway_config=config,
+        )
+        yield server
+        server.shutdown()
+        server.server_close()
+
+    def test_models_returns_200(self, config_gateway):
+        """GET /v1/models returns HTTP 200."""
+        port = config_gateway.server_address[1]
+        resp = _gateway_request(port, path="/v1/models", method="GET")
+        assert resp.status == 200
+
+    def test_models_returns_json(self, config_gateway):
+        """GET /v1/models returns application/json."""
+        port = config_gateway.server_address[1]
+        resp = _gateway_request(port, path="/v1/models", method="GET")
+        assert "application/json" in resp.headers.get("Content-Type", "")
+
+    def test_models_contains_config_models(self, config_gateway):
+        """GET /v1/models lists models defined in the gateway config."""
+        port = config_gateway.server_address[1]
+        resp = _gateway_request(port, path="/v1/models", method="GET")
+        data = json.loads(resp.read().decode())
+
+        assert "data" in data
+        ids = {m["id"] for m in data["data"]}
+        assert "arcee-ai/trinity-large-preview:free" in ids
+        assert "google/gemma-3-27b-it:free" in ids
+
+    def test_models_response_shape(self, config_gateway):
+        """Each model entry has required fields."""
+        port = config_gateway.server_address[1]
+        resp = _gateway_request(port, path="/v1/models", method="GET")
+        data = json.loads(resp.read().decode())
+
+        for model in data["data"]:
+            assert "id" in model
+            assert "type" in model
+            assert model["type"] == "model"
+            assert "display_name" in model
+
+    def test_models_has_correct_count(self, config_gateway):
+        """Exactly two models are returned (matching the config)."""
+        port = config_gateway.server_address[1]
+        resp = _gateway_request(port, path="/v1/models", method="GET")
+        data = json.loads(resp.read().decode())
+        assert len(data["data"]) == 2
+
+    def test_models_cors_header(self, config_gateway):
+        """CORS header is present on /v1/models response."""
+        port = config_gateway.server_address[1]
+        resp = _gateway_request(port, path="/v1/models", method="GET")
+        assert resp.headers.get("Access-Control-Allow-Origin") == "*"
+
+    def test_models_no_api_key_needed(self):
+        """Config-driven /v1/models works without any API key configured."""
+        config = _build_openrouter_config("http://127.0.0.1:1")
+        server, thread = run_passthrough_in_thread(
+            host="127.0.0.1",
+            port=0,
+            api_key=None,
+            gateway_config=config,
+        )
+        port = server.server_address[1]
+        original_key = os.environ.pop("ANTHROPIC_API_KEY", None)
+        try:
+            resp = _gateway_request(port, path="/v1/models", method="GET")
+            assert resp.status == 200
+            data = json.loads(resp.read().decode())
+            assert len(data["data"]) == 2
+        finally:
+            if original_key is not None:
+                os.environ["ANTHROPIC_API_KEY"] = original_key
+            server.shutdown()
+            server.server_close()
+
+
+class TestConfigDrivenMessagesRouting:
+    """Tests for /v1/messages routed to a configured provider."""
+
+    @pytest.fixture(scope="class")
+    def mock_provider_server(self):
+        """Start a mock provider (OpenRouter-style) server."""
+        server = ThreadedGatewayServer(("127.0.0.1", 0), _MockProviderHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        yield server
+        server.shutdown()
+        server.server_close()
+
+    @pytest.fixture(scope="class")
+    def config_gateway_with_provider(self, mock_provider_server):
+        """Gateway configured to route messages to the mock provider."""
+        mock_host, mock_port = mock_provider_server.server_address
+        api_base = f"http://{mock_host}:{mock_port}/api/v1"
+        config = _build_openrouter_config(api_base)
+        os.environ["OPENROUTER_API_KEY"] = "test-openrouter-key"
+
+        server, thread = run_passthrough_in_thread(
+            host="127.0.0.1",
+            port=0,
+            gateway_config=config,
+        )
+        yield server
+        server.shutdown()
+        server.server_close()
+        os.environ.pop("OPENROUTER_API_KEY", None)
+
+    def test_messages_forwarded_to_provider(self, config_gateway_with_provider):
+        """POST /v1/messages is forwarded to the configured provider."""
+        port = config_gateway_with_provider.server_address[1]
+        resp = _make_messages_request(port, model="arcee-ai/trinity-large-preview:free")
+        assert resp.status == 200
+        data = json.loads(resp.read().decode())
+        assert data["type"] == "message"
+
+    def test_bearer_auth_sent_to_provider(self, config_gateway_with_provider):
+        """Bearer token authentication is used for the provider."""
+        _MockProviderHandler.last_auth = None
+        port = config_gateway_with_provider.server_address[1]
+        _make_messages_request(port, model="arcee-ai/trinity-large-preview:free")
+        assert _MockProviderHandler.last_auth == "Bearer test-openrouter-key"
+
+    def test_path_transformed_for_provider(self, config_gateway_with_provider):
+        """Request path is transformed from /v1/messages to /api/v1/messages."""
+        _MockProviderHandler.last_path = None
+        port = config_gateway_with_provider.server_address[1]
+        _make_messages_request(port, model="arcee-ai/trinity-large-preview:free")
+        assert _MockProviderHandler.last_path == "/api/v1/messages"
+
+    def test_create_passthrough_server_accepts_gateway_config(self):
+        """create_passthrough_server correctly stores gateway_config on handler."""
+        config = _build_openrouter_config("https://openrouter.ai/api/v1")
+        server = create_passthrough_server(
+            host="127.0.0.1", port=0, gateway_config=config
+        )
+        assert server.RequestHandlerClass.gateway_config is config
+        server.server_close()
