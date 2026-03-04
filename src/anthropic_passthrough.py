@@ -167,10 +167,26 @@ class AnthropicPassthroughHandler(http.server.BaseHTTPRequestHandler):
             self._serve_models_from_config()
             return
 
+        # Read the request body early so we can inspect the ``model`` field
+        # before deciding which upstream provider to route to.
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length) if content_length > 0 else None
+
+        # Extract model name and streaming flag from the body.
+        is_streaming = False
+        request_model: Optional[str] = None
+        if body:
+            try:
+                request_data = json.loads(body)
+                is_streaming = request_data.get("stream", False)
+                request_model = request_data.get("model")
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
         # Determine upstream connection params and auth headers.
-        # When a gateway config with a valid provider is present, use that
-        # provider's api_base and credentials; otherwise fall through to the
-        # default Anthropic pass-through behaviour.
+        # When a gateway config is present, route by the model field so each
+        # provider's models reach the correct upstream; fall back to the
+        # default provider for unknown models or when no model is specified.
         upstream_host: str = self.anthropic_api_host
         upstream_port: int = self.anthropic_api_port
         upstream_https: bool = self.use_https
@@ -178,7 +194,11 @@ class AnthropicPassthroughHandler(http.server.BaseHTTPRequestHandler):
         upstream_headers: dict[str, str]
 
         if self.gateway_config is not None:
-            provider = self.gateway_config.get_provider()
+            # Select provider by model name when available; fall back to default.
+            if request_model:
+                provider = self.gateway_config.find_provider_for_model(request_model)
+            else:
+                provider = self.gateway_config.get_provider()
             if provider and provider.api_base:
                 parsed = self._parse_api_base(provider.api_base)
                 if parsed is None:
@@ -242,19 +262,6 @@ class AnthropicPassthroughHandler(http.server.BaseHTTPRequestHandler):
                 )
                 return
             upstream_headers = self._build_upstream_headers(api_key)
-
-        # Read request body
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length) if content_length > 0 else None
-
-        # Determine if this is a streaming request
-        is_streaming = False
-        if body:
-            try:
-                request_data = json.loads(body)
-                is_streaming = request_data.get("stream", False)
-            except (json.JSONDecodeError, AttributeError):
-                pass
 
         # Add Content-Type and Content-Length for body requests
         if body is not None:
@@ -1002,17 +1009,24 @@ def create_passthrough_server(
     Returns:
         A configured ThreadedGatewayServer instance.
     """
-    handler = AnthropicPassthroughHandler
-    handler.upstream_timeout = timeout
-    handler.api_key = api_key
-    handler.anthropic_api_host = anthropic_api_host
-    handler.anthropic_api_port = anthropic_api_port
-    handler.anthropic_version = anthropic_version
-    handler.use_https = use_https
-    handler.max_retries = max_retries
-    handler.retry_base_delay = retry_base_delay
-    handler.retry_max_delay = retry_max_delay
-    handler.gateway_config = gateway_config
+    # Build a per-server subclass so that configuring one server does not
+    # mutate the shared class-level defaults on AnthropicPassthroughHandler.
+    handler: type[AnthropicPassthroughHandler] = type(
+        "_GatewayHandler",
+        (AnthropicPassthroughHandler,),
+        {
+            "upstream_timeout": timeout,
+            "api_key": api_key,
+            "anthropic_api_host": anthropic_api_host,
+            "anthropic_api_port": anthropic_api_port,
+            "anthropic_version": anthropic_version,
+            "use_https": use_https,
+            "max_retries": max_retries,
+            "retry_base_delay": retry_base_delay,
+            "retry_max_delay": retry_max_delay,
+            "gateway_config": gateway_config,
+        },
+    )
 
     server = ThreadedGatewayServer((host, port), handler)
     return server

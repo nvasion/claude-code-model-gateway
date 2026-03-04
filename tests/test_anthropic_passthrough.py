@@ -1130,3 +1130,193 @@ class TestConfigDrivenMessagesRouting:
         )
         assert server.RequestHandlerClass.gateway_config is config
         server.server_close()
+
+
+# ------------------------------------------------------------------ #
+# Tests: Model-based provider routing
+# ------------------------------------------------------------------ #
+
+
+class _MockProviderAHandler(http.server.BaseHTTPRequestHandler):
+    """Mock provider A — records calls and returns a distinctive body."""
+
+    was_called = False
+
+    def log_message(self, format, *args):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        self.rfile.read(length)
+        _MockProviderAHandler.was_called = True
+        resp = json.dumps(
+            {
+                "id": "msg_a",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "from provider A"}],
+                "model": "model-a",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 5, "output_tokens": 3},
+            }
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(resp)))
+        self.end_headers()
+        self.wfile.write(resp)
+
+
+class _MockProviderBHandler(http.server.BaseHTTPRequestHandler):
+    """Mock provider B — records calls and returns a distinctive body."""
+
+    was_called = False
+
+    def log_message(self, format, *args):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        self.rfile.read(length)
+        _MockProviderBHandler.was_called = True
+        resp = json.dumps(
+            {
+                "id": "msg_b",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "from provider B"}],
+                "model": "model-b",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 5, "output_tokens": 3},
+            }
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(resp)))
+        self.end_headers()
+        self.wfile.write(resp)
+
+
+def _build_two_provider_config(base_a: str, base_b: str) -> GatewayConfig:
+    """Build a GatewayConfig with two distinct providers for routing tests."""
+    from src.models import AuthType, ModelConfig, ProviderConfig
+
+    prov_a = ProviderConfig(
+        name="provider-a",
+        display_name="Provider A",
+        api_base=base_a,
+        api_key_env_var="",
+        auth_type=AuthType.NONE,
+        models={"model-a": ModelConfig(name="model-a")},
+    )
+    prov_b = ProviderConfig(
+        name="provider-b",
+        display_name="Provider B",
+        api_base=base_b,
+        api_key_env_var="",
+        auth_type=AuthType.NONE,
+        models={"model-b": ModelConfig(name="model-b")},
+    )
+    return GatewayConfig(
+        default_provider="provider-a",
+        providers={"provider-a": prov_a, "provider-b": prov_b},
+    )
+
+
+class TestModelBasedRouting:
+    """Tests for model-name-based provider routing in config-driven mode."""
+
+    @pytest.fixture(scope="class")
+    def provider_a_server(self):
+        """Mock upstream for provider A."""
+        _MockProviderAHandler.was_called = False
+        server = ThreadedGatewayServer(("127.0.0.1", 0), _MockProviderAHandler)
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        yield server
+        server.shutdown()
+        server.server_close()
+
+    @pytest.fixture(scope="class")
+    def provider_b_server(self):
+        """Mock upstream for provider B."""
+        _MockProviderBHandler.was_called = False
+        server = ThreadedGatewayServer(("127.0.0.1", 0), _MockProviderBHandler)
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        yield server
+        server.shutdown()
+        server.server_close()
+
+    @pytest.fixture(scope="class")
+    def routing_gateway(self, provider_a_server, provider_b_server):
+        """Gateway with two providers, routing messages by model name."""
+        host_a, port_a = provider_a_server.server_address
+        host_b, port_b = provider_b_server.server_address
+
+        config = _build_two_provider_config(
+            f"http://{host_a}:{port_a}/v1",
+            f"http://{host_b}:{port_b}/v1",
+        )
+        server, thread = run_passthrough_in_thread(
+            host="127.0.0.1", port=0, gateway_config=config
+        )
+        yield server
+        server.shutdown()
+        server.server_close()
+
+    def test_model_a_routes_to_provider_a(
+        self, routing_gateway, provider_a_server, provider_b_server
+    ):
+        """Request with model-a is routed to provider A's upstream."""
+        _MockProviderAHandler.was_called = False
+        _MockProviderBHandler.was_called = False
+
+        port = routing_gateway.server_address[1]
+        _make_messages_request(port, model="model-a")
+
+        assert _MockProviderAHandler.was_called is True
+        assert _MockProviderBHandler.was_called is False
+
+    def test_model_b_routes_to_provider_b(
+        self, routing_gateway, provider_a_server, provider_b_server
+    ):
+        """Request with model-b is routed to provider B's upstream."""
+        _MockProviderAHandler.was_called = False
+        _MockProviderBHandler.was_called = False
+
+        port = routing_gateway.server_address[1]
+        _make_messages_request(port, model="model-b")
+
+        assert _MockProviderAHandler.was_called is False
+        assert _MockProviderBHandler.was_called is True
+
+    def test_unknown_model_falls_back_to_default_provider(
+        self, routing_gateway, provider_a_server, provider_b_server
+    ):
+        """Request with an unknown model falls back to the default provider (A)."""
+        _MockProviderAHandler.was_called = False
+        _MockProviderBHandler.was_called = False
+
+        port = routing_gateway.server_address[1]
+        _make_messages_request(port, model="some-unknown-model")
+
+        # Default is provider-a, so provider A should receive the request
+        assert _MockProviderAHandler.was_called is True
+        assert _MockProviderBHandler.was_called is False
+
+    def test_model_a_response_body_returned(self, routing_gateway):
+        """Response body from provider A is relayed back to the client."""
+        port = routing_gateway.server_address[1]
+        resp = _make_messages_request(port, model="model-a")
+        data = json.loads(resp.read().decode())
+        assert data["type"] == "message"
+        assert data["content"][0]["text"] == "from provider A"
+
+    def test_model_b_response_body_returned(self, routing_gateway):
+        """Response body from provider B is relayed back to the client."""
+        port = routing_gateway.server_address[1]
+        resp = _make_messages_request(port, model="model-b")
+        data = json.loads(resp.read().decode())
+        assert data["type"] == "message"
+        assert data["content"][0]["text"] == "from provider B"

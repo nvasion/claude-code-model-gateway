@@ -1115,6 +1115,381 @@ def _set_provider_enabled(
 
 
 # ---------------------------------------------------------------------------
+# Models commands
+# ---------------------------------------------------------------------------
+
+
+@main.group()
+def models():
+    """List and inspect models across all configured providers.
+
+    Shows which models are available via the gateway and which provider
+    each model belongs to. Use these to identify model IDs for the
+    Claude Code /model picker or the ``provider set-default`` command.
+    """
+    pass
+
+
+@models.command("list")
+@click.option(
+    "--config-file",
+    "-c",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Path to configuration file.",
+)
+@click.option(
+    "--format",
+    "fmt",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    show_default=True,
+    help="Output format.",
+)
+@click.option(
+    "--provider",
+    "provider_filter",
+    default=None,
+    help="Filter to models from a specific provider.",
+)
+def models_list(config_file: Optional[str], fmt: str, provider_filter: Optional[str]):
+    """List all models available through the gateway.
+
+    Displays every model across all enabled providers so you can identify
+    the model ID to use with the Claude Code ``/model`` picker or the
+    ``ANTHROPIC_BASE_URL`` gateway setup.
+
+    Example:
+
+        claude-code-model-gateway models list
+
+        claude-code-model-gateway models list --provider openai
+
+        claude-code-model-gateway models list --format json
+    """
+    import json as json_mod
+
+    from src.config import ConfigError, load_config
+
+    path = Path(config_file) if config_file else None
+
+    try:
+        config_obj = load_config(path=path, validate=False)
+    except ConfigError as e:
+        click.echo(f"Error: {e}", err=True)
+        raise SystemExit(1)
+
+    enabled = config_obj.get_enabled_providers()
+
+    if not enabled:
+        click.echo("No enabled providers configured.")
+        click.echo("Run 'config init' to create a configuration with default providers.")
+        return
+
+    # Apply optional provider filter
+    if provider_filter:
+        if provider_filter not in enabled:
+            click.echo(
+                f"Error: Provider '{provider_filter}' not found or not enabled.",
+                err=True,
+            )
+            available = ", ".join(sorted(enabled.keys()))
+            click.echo(f"Enabled providers: {available}", err=True)
+            raise SystemExit(1)
+        enabled = {provider_filter: enabled[provider_filter]}
+
+    if fmt == "json":
+        rows = []
+        for provider_name, provider in sorted(enabled.items()):
+            for model_name, model in sorted(provider.models.items()):
+                rows.append(
+                    {
+                        "id": model.name,
+                        "display_name": model.display_name,
+                        "provider": provider_name,
+                        "provider_display_name": provider.display_name,
+                        "max_tokens": model.max_tokens,
+                        "supports_streaming": model.supports_streaming,
+                        "supports_tools": model.supports_tools,
+                        "supports_vision": model.supports_vision,
+                    }
+                )
+        click.echo(json_mod.dumps({"models": rows, "total": len(rows)}, indent=2))
+        return
+
+    # Text output
+    total = sum(len(p.models) for p in enabled.values())
+    default_provider = config_obj.default_provider
+
+    click.echo(f"Gateway models ({total} total across {len(enabled)} provider(s)):")
+    click.echo("=" * 60)
+
+    for provider_name, provider in sorted(enabled.items()):
+        if not provider.models:
+            continue
+        default_marker = " (default)" if provider_name == default_provider else ""
+        click.echo(
+            f"\n  {provider.display_name} ({provider_name}){default_marker}"
+            f" — {len(provider.models)} model(s)"
+        )
+        click.echo(f"  {'─' * 56}")
+        for model_name, model in sorted(provider.models.items()):
+            features = []
+            if model.supports_streaming:
+                features.append("stream")
+            if model.supports_tools:
+                features.append("tools")
+            if model.supports_vision:
+                features.append("vision")
+            feature_str = f"[{', '.join(features)}]" if features else ""
+            display = (
+                f"  {model.display_name}" if model.display_name != model.name
+                else f"  {model.name}"
+            )
+            click.echo(f"  {display}")
+            click.echo(f"    id: {model.name}  {feature_str}")
+
+    click.echo()
+    click.echo(
+        "Tip: use these model IDs with the Claude Code /model command after "
+        "setting ANTHROPIC_BASE_URL=http://<host>:<port>"
+    )
+
+
+@models.command("show")
+@click.argument("model_id")
+@click.option(
+    "--config-file",
+    "-c",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Path to configuration file.",
+)
+def models_show(model_id: str, config_file: Optional[str]):
+    """Show details for a specific model.
+
+    MODEL_ID is the model identifier (e.g., 'gpt-4o', 'gemini-2.0-flash').
+
+    Example:
+
+        claude-code-model-gateway models show gpt-4o
+
+        claude-code-model-gateway models show claude-3-5-sonnet-20241022
+    """
+    from src.config import ConfigError, load_config
+
+    path = Path(config_file) if config_file else None
+
+    try:
+        config_obj = load_config(path=path, validate=False)
+    except ConfigError as e:
+        click.echo(f"Error: {e}", err=True)
+        raise SystemExit(1)
+
+    provider = config_obj.find_provider_for_model(model_id)
+    if provider is None:
+        click.echo(f"Error: Model '{model_id}' not found in any configured provider.", err=True)
+        raise SystemExit(1)
+
+    model = provider.models.get(model_id)
+    if model is None:
+        # find_provider_for_model fell back to default provider, model not in config
+        click.echo(
+            f"Warning: Model '{model_id}' is not explicitly listed in any provider.",
+            err=True,
+        )
+        click.echo(
+            f"  It would be forwarded to the default provider: "
+            f"{provider.display_name} ({provider.name})",
+            err=True,
+        )
+        raise SystemExit(1)
+
+    is_default_provider = provider.name == config_obj.default_provider
+
+    click.echo(f"Model: {model.display_name}")
+    click.echo("=" * 50)
+    click.echo(f"  ID:             {model.name}")
+    click.echo(f"  Provider:       {provider.display_name} ({provider.name})")
+    if is_default_provider:
+        click.echo("  ★ Provider is the gateway default")
+    click.echo(f"  Max tokens:     {model.max_tokens:,}")
+    click.echo(f"  Streaming:      {'yes' if model.supports_streaming else 'no'}")
+    click.echo(f"  Tool use:       {'yes' if model.supports_tools else 'no'}")
+    click.echo(f"  Vision:         {'yes' if model.supports_vision else 'no'}")
+    click.echo(f"  API base:       {provider.api_base}")
+    if provider.api_key_env_var:
+        click.echo(f"  API key env:    ${provider.api_key_env_var}")
+    if model.extra:
+        click.echo("  Extra:")
+        for k, v in model.extra.items():
+            click.echo(f"    {k}: {v}")
+
+
+# ---------------------------------------------------------------------------
+# Third-party models — installable discovery command
+# ---------------------------------------------------------------------------
+
+
+@main.command("third-party-models")
+@click.option(
+    "--config-file",
+    "-c",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    envvar="GATEWAY_CONFIG",
+    help=(
+        "Path to the gateway config file. "
+        "Auto-detected from gateway.yaml in the current directory "
+        "or the GATEWAY_CONFIG environment variable."
+    ),
+)
+@click.option(
+    "--host",
+    default="127.0.0.1",
+    show_default=True,
+    help="Gateway host (for the ANTHROPIC_BASE_URL hint).",
+)
+@click.option(
+    "--port",
+    default=8080,
+    show_default=True,
+    type=int,
+    help="Gateway port (for the ANTHROPIC_BASE_URL hint).",
+)
+def third_party_models(config_file: Optional[str], host: str, port: int):
+    """List third-party models available through the gateway.
+
+    Shows every model configured across all enabled providers and prints
+    step-by-step instructions for pointing Claude Code at the gateway so
+    the models appear in the ``/model`` picker.
+
+    This command is the installed equivalent of the ``/third-party-models``
+    Claude Code slash command — it works the same way whether you are inside
+    the project repo or have only run ``pip install claude-code-model-gateway``.
+
+    Example:
+
+    \b
+        claude-code-model-gateway third-party-models
+        claude-code-model-gateway third-party-models --config gateway.yaml
+        claude-code-model-gateway third-party-models --port 9090
+    """
+    import os
+
+    from src.config import ConfigError, find_config_file, load_config
+
+    # Auto-detect config file when not supplied explicitly
+    if not config_file:
+        detected = find_config_file()
+        if detected:
+            config_file = str(detected)
+
+    gateway_url = f"http://{host}:{port}"
+
+    click.echo("Third-Party Models via Gateway")
+    click.echo("=" * 60)
+
+    if not config_file:
+        click.echo()
+        click.secho(
+            "No gateway configuration file found.", fg="yellow"
+        )
+        click.echo()
+        click.echo("Run the following to create one with all built-in providers:")
+        click.echo()
+        click.echo("    claude-code-model-gateway config init")
+        click.echo()
+        click.echo(
+            "Then edit gateway.yaml, enable the providers you want, "
+            "and run this command again."
+        )
+        raise SystemExit(0)
+
+    try:
+        config_obj = load_config(path=Path(config_file), validate=False)
+    except ConfigError as e:
+        click.secho(f"Error loading config '{config_file}': {e}", fg="red", err=True)
+        raise SystemExit(1)
+
+    enabled = config_obj.get_enabled_providers()
+
+    if not enabled:
+        click.echo()
+        click.secho("No enabled providers in configuration.", fg="yellow")
+        click.echo("Enable a provider with:")
+        click.echo("    claude-code-model-gateway provider enable <name>")
+        raise SystemExit(0)
+
+    # Print the model table
+    click.echo(f"  Config:    {config_file}")
+    total = sum(len(p.models) for p in enabled.values())
+    click.echo(
+        f"  Providers: {len(enabled)} enabled  |  Models: {total} total"
+    )
+    click.echo()
+
+    for provider_name, provider in sorted(enabled.items()):
+        if not provider.models:
+            continue
+        default_marker = " (default)" if provider_name == config_obj.default_provider else ""
+        click.echo(
+            f"  {provider.display_name} ({provider_name}){default_marker}"
+        )
+        for model_name, model in sorted(provider.models.items()):
+            caps = []
+            if model.supports_tools:
+                caps.append("tools")
+            if model.supports_vision:
+                caps.append("vision")
+            cap_str = f"  [{', '.join(caps)}]" if caps else ""
+            click.echo(f"    {model_name}{cap_str}")
+        click.echo()
+
+    # Print Claude Code integration instructions
+    click.echo("─" * 60)
+    click.echo("How to use these models in Claude Code")
+    click.echo("─" * 60)
+    click.echo()
+    click.echo("1. Start the gateway (in a separate terminal):")
+    click.echo()
+    click.echo(f"       claude-code-model-gateway gateway --config {config_file}")
+    click.echo()
+    click.echo("2. Point Claude Code at the gateway:")
+    click.echo()
+
+    current_url = os.environ.get("ANTHROPIC_BASE_URL", "")
+    if current_url:
+        click.echo(f"       ANTHROPIC_BASE_URL is already set: {current_url}")
+    else:
+        click.echo(f"       export ANTHROPIC_BASE_URL={gateway_url}")
+        click.echo()
+        click.echo("   Or prefix each Claude Code session:")
+        click.echo()
+        click.echo(f"       ANTHROPIC_BASE_URL={gateway_url} claude")
+
+    click.echo()
+    click.echo("3. Switch models inside Claude Code using:")
+    click.echo()
+    click.echo("       /model <model-id>")
+    click.echo()
+    click.echo("   Example:  /model gpt-4o")
+    click.echo()
+    click.echo(
+        "   The gateway automatically routes each request to the correct "
+        "provider based on the model id."
+    )
+    click.echo()
+    click.echo("─" * 60)
+    click.echo("Other useful commands")
+    click.echo("─" * 60)
+    click.echo()
+    click.echo("  claude-code-model-gateway models list            # all models")
+    click.echo("  claude-code-model-gateway models show <model-id> # model details")
+    click.echo("  claude-code-model-gateway provider list          # provider status")
+
+
+# ---------------------------------------------------------------------------
 # Configuration validation and testing commands
 # ---------------------------------------------------------------------------
 

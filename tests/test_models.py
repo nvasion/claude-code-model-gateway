@@ -485,6 +485,103 @@ class TestGatewayConfig:
         assert "openai" in restored.providers
         assert "gpt-4" in restored.providers["openai"].models
 
+    # ------------------------------------------------------------------
+    # find_provider_for_model tests
+    # ------------------------------------------------------------------
+
+    def _make_multi_provider_config(self) -> GatewayConfig:
+        """Build a GatewayConfig with two providers for routing tests."""
+        openai_provider = ProviderConfig(
+            name="openai",
+            display_name="OpenAI",
+            api_base="https://api.openai.com/v1",
+            models={
+                "gpt-4o": ModelConfig(name="gpt-4o"),
+                "gpt-4o-mini": ModelConfig(name="gpt-4o-mini"),
+            },
+        )
+        anthropic_provider = ProviderConfig(
+            name="anthropic",
+            display_name="Anthropic",
+            api_base="https://api.anthropic.com/v1",
+            models={
+                "claude-sonnet-4-20250514": ModelConfig(name="claude-sonnet-4-20250514"),
+            },
+        )
+        return GatewayConfig(
+            default_provider="anthropic",
+            providers={
+                "openai": openai_provider,
+                "anthropic": anthropic_provider,
+            },
+        )
+
+    def test_find_provider_for_model_returns_correct_provider(self):
+        """find_provider_for_model returns the provider that owns the model."""
+        config = self._make_multi_provider_config()
+        provider = config.find_provider_for_model("gpt-4o")
+        assert provider is not None
+        assert provider.name == "openai"
+
+    def test_find_provider_for_model_second_provider(self):
+        """find_provider_for_model finds models in the second provider."""
+        config = self._make_multi_provider_config()
+        provider = config.find_provider_for_model("claude-sonnet-4-20250514")
+        assert provider is not None
+        assert provider.name == "anthropic"
+
+    def test_find_provider_for_model_unknown_falls_back_to_default(self):
+        """Unknown model name falls back to the default provider."""
+        config = self._make_multi_provider_config()
+        provider = config.find_provider_for_model("some-unknown-model")
+        assert provider is not None
+        assert provider.name == "anthropic"  # the default provider
+
+    def test_find_provider_for_model_skips_disabled_providers(self):
+        """Disabled providers are not considered during model lookup."""
+        disabled_openai = ProviderConfig(
+            name="openai",
+            models={"gpt-4o": ModelConfig(name="gpt-4o")},
+            enabled=False,
+        )
+        default_provider = ProviderConfig(
+            name="anthropic",
+            models={"claude-sonnet-4-20250514": ModelConfig(name="claude-sonnet-4-20250514")},
+            enabled=True,
+        )
+        config = GatewayConfig(
+            default_provider="anthropic",
+            providers={
+                "openai": disabled_openai,
+                "anthropic": default_provider,
+            },
+        )
+        # gpt-4o is in the disabled openai provider, should fall back to default
+        provider = config.find_provider_for_model("gpt-4o")
+        assert provider is not None
+        assert provider.name == "anthropic"
+
+    def test_find_provider_for_model_no_providers_returns_none(self):
+        """Returns None when no providers are configured."""
+        config = GatewayConfig()
+        provider = config.find_provider_for_model("gpt-4o")
+        assert provider is None
+
+    def test_find_provider_for_model_all_providers_disabled_returns_none(self):
+        """Returns None when all providers are disabled and no default matches."""
+        config = GatewayConfig(
+            default_provider="nonexistent",
+            providers={
+                "openai": ProviderConfig(
+                    name="openai",
+                    models={"gpt-4o": ModelConfig(name="gpt-4o")},
+                    enabled=False,
+                ),
+            },
+        )
+        provider = config.find_provider_for_model("gpt-4o")
+        assert provider is None  # default_provider 'nonexistent' not in providers
+
 
 # ---------------------------------------------------------------------------
 # AuthType tests
