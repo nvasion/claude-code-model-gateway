@@ -224,6 +224,27 @@ class GatewayConfig:
         """Return list of all provider names."""
         return sorted(self.providers.keys())
 
+    def find_provider_for_model(self, model_name: str) -> Optional[ProviderConfig]:
+        """Find which enabled provider owns the given model name.
+
+        Searches all enabled providers for a model matching *model_name*.
+        Falls back to the default provider if no enabled provider claims
+        the model, so that unknown / custom model IDs are still forwarded
+        somewhere useful rather than being dropped.
+
+        Args:
+            model_name: The model ID to look up (e.g., ``'gpt-4o'``).
+
+        Returns:
+            The :class:`ProviderConfig` that owns the model, or the default
+            provider when no enabled provider lists the model.
+        """
+        for provider in self.get_enabled_providers().values():
+            if model_name in provider.models:
+                return provider
+        # No match found — fall back to the default provider.
+        return self.get_provider()
+
     def add_provider(self, provider: ProviderConfig) -> None:
         """Add or update a provider configuration.
 
