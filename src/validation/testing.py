@@ -207,12 +207,13 @@ class ConfigTestRunner:
             test_case.config_data = data
         except ConfigError as e:
             validation = ValidationResult()
-            validation.add_error("", f"Failed to load config: {e}")
+            failure_reason = f"Failed to load config: {e}"
+            validation.add_error("", failure_reason)
             return ConfigTestResult(
                 test_case=test_case,
                 passed=False,
                 validation_result=validation,
-                failure_reason=str(e),
+                failure_reason=failure_reason,
             )
 
         return cls.run_test(test_case)

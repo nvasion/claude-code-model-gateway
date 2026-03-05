@@ -117,9 +117,7 @@ class TestServiceManager:
         mgr = ServiceManager()
         with mock.patch.dict(os.environ, {"GATEWAY_ENV_FILE": str(env_file)}):
             mgr._handle_reload(signal.SIGHUP, None)
-
-        assert os.environ.get("RELOAD_TEST_VAR") == "reloaded"
-        os.environ.pop("RELOAD_TEST_VAR", None)
+            assert os.environ.get("RELOAD_TEST_VAR") == "reloaded"
 
 
 class TestEnvHelpers:

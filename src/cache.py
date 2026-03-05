@@ -650,7 +650,7 @@ def cached(
     """
 
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
-        _cache = cache or Cache(
+        _cache = cache if cache is not None else Cache(
             maxsize=maxsize, ttl=ttl, name=f"cached:{func.__qualname__}"
         )
         _key_func = key_func or _make_cache_key
