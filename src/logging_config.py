@@ -571,7 +571,7 @@ def create_formatter(
     Returns:
         A configured logging.Formatter instance.
     """
-    fmt_str = str(log_format).lower()
+    fmt_str = getattr(log_format, "value", str(log_format)).lower()
 
     if fmt_str == "json":
         return JSONFormatter(

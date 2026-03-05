@@ -299,22 +299,21 @@ class ConfigValidator:
                     "API base URL is required.",
                     suggestion="Provide a URL like 'https://api.openai.com/v1'.",
                 )
+            elif "<" in provider.api_base:
+                # Template URL with <placeholders> — warn before deployment
+                result.add_warning(
+                    f"{prefix}.api_base",
+                    "API base contains placeholder(s). "
+                    "Replace before deployment.",
+                    provider.api_base,
+                )
             elif not _URL_PATTERN.match(provider.api_base):
-                # Allow template URLs with <placeholders>
-                if "<" not in provider.api_base:
-                    result.add_error(
-                        f"{prefix}.api_base",
-                        "API base must be a valid HTTP(S) URL.",
-                        provider.api_base,
-                        "Use a URL like 'https://api.openai.com/v1'.",
-                    )
-                else:
-                    result.add_warning(
-                        f"{prefix}.api_base",
-                        "API base contains placeholder(s). "
-                        "Replace before deployment.",
-                        provider.api_base,
-                    )
+                result.add_error(
+                    f"{prefix}.api_base",
+                    "API base must be a valid HTTP(S) URL.",
+                    provider.api_base,
+                    "Use a URL like 'https://api.openai.com/v1'.",
+                )
 
             # Auth type
             try:

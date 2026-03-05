@@ -461,7 +461,16 @@ class _Attempt:
 
         unlimited = self._ctx.config.max_attempts == 0
         if not unlimited and self.number >= self._ctx.config.max_attempts:
-            return False  # Last attempt — propagate
+            # Last attempt exhausted — raise RetryExhaustedError
+            self._ctx.stats.total_elapsed = time.monotonic() - self._ctx._start_time
+            raise RetryExhaustedError(
+                f"All {self.number} retry attempts exhausted "
+                f"after {self._ctx.stats.total_elapsed:.2f}s",
+                attempts=self.number,
+                total_elapsed=self._ctx.stats.total_elapsed,
+                last_error=exc_val,
+                errors=self._ctx.stats.errors,
+            )
 
         if self._ctx.config.total_timeout and elapsed >= self._ctx.config.total_timeout:
             return False
