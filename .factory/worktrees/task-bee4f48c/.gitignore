@@ -1,0 +1,45 @@
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test files
+*.test
+*.out
+
+# Dependencies
+vendor/
+node_modules/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+src/*.egg-info/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+venv/
+.venv/
+*.egg
+
+# Logs
+*.log
+
+# Service runtime (not tracked)
+*.pid

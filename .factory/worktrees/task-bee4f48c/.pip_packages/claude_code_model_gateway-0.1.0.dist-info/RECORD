@@ -1,0 +1,13 @@
+../../bin/claude-code-model-gateway,sha256=ZchXT4Ev2fBmShW4H-WXB16v9Fa65KQWyPXtrw5ADZI,206
+../../bin/claude-code-model-gateway-service,sha256=rwGPUJrM5eihN3lb-8PhwaCwNs3oZBhh-eoM1cSWtTw,210
+__editable__.claude_code_model_gateway-0.1.0.pth,sha256=GHMg2rNyUi7JOYMT6ad6vgg0hFtLYKh56Y_2hcwAHi8,121
+__editable___claude_code_model_gateway_0_1_0_finder.py,sha256=mfOI_qVkS-dcRtJdJ7I2WKlpwj2mguZDuX_OVLiQBcg,3685
+__pycache__/__editable___claude_code_model_gateway_0_1_0_finder.cpython-311.pyc,,
+claude_code_model_gateway-0.1.0.dist-info/INSTALLER,sha256=zuuue4knoyJ-UwPPXg8fezS7VCrXJQrAP7zeNuwvFQg,4
+claude_code_model_gateway-0.1.0.dist-info/METADATA,sha256=g0yj4WjqnX3q5tIjBUqLtMWexFxVp0AwbYR48FBCTUM,23073
+claude_code_model_gateway-0.1.0.dist-info/RECORD,,
+claude_code_model_gateway-0.1.0.dist-info/REQUESTED,sha256=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU,0
+claude_code_model_gateway-0.1.0.dist-info/WHEEL,sha256=YCfwYGOYMi5Jhw2fU4yNgwErybb2IX5PEwBKV4ZbdBo,91
+claude_code_model_gateway-0.1.0.dist-info/direct_url.json,sha256=WDZ1t4OgouXyKPRuDcPEO2iZbx9P_hiM5-qdGSUOMDw,60
+claude_code_model_gateway-0.1.0.dist-info/entry_points.txt,sha256=TPNeU0LZv3Tj7Kl1xqFiSWyfe289Z2mxRHACzTChM0E,112
+claude_code_model_gateway-0.1.0.dist-info/top_level.txt,sha256=Xt3SAWQj5IM1Mzr_EsHTzOR29P0o0jXyhgKDdRKY8xg,26

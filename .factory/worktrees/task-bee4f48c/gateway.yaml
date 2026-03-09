@@ -1,0 +1,55 @@
+# gateway.yaml — claude-code-model-gateway configuration
+#
+# This file is loaded automatically when the gateway starts.  Set the
+# GATEWAY_CONFIG environment variable to override the search path.
+
+default_provider: openrouter
+
+# ---------------------------------------------------------------------------
+# Model name aliases
+# ---------------------------------------------------------------------------
+# Maps incoming model names to the upstream model IDs the provider expects.
+# Claude Code always sends Claude model names (e.g. claude-sonnet-4-20250514);
+# the gateway rewrites them before forwarding so free/alternative provider
+# models are used instead of paid Anthropic models.
+#
+# Alias names are also exposed through /v1/models so Claude Code's /model
+# picker can select them by their familiar names.
+model_aliases:
+  "claude-sonnet-4-20250514": "arcee-ai/trinity-large-preview:free"
+  "claude-sonnet-4-6-20250514": "arcee-ai/trinity-large-preview:free"
+  "claude-opus-4-20250514": "openai/gpt-oss-120b:free"
+  "claude-haiku-3-5-20241022": "google/gemma-3-27b-it:free"
+
+log_level: info
+timeout: 300
+max_retries: 3
+
+# ---------------------------------------------------------------------------
+# Provider configuration
+# ---------------------------------------------------------------------------
+providers:
+  openrouter:
+    enabled: true
+    api_base: "https://openrouter.ai/api/v1"
+    api_key_env_var: "OPENROUTER_API_KEY"
+    auth_type: "bearer_token"
+    models:
+      - name: "arcee-ai/trinity-large-preview:free"
+        display_name: "Arcee Trinity Large (free)"
+        max_tokens: 32768
+        supports_streaming: true
+        supports_tools: true
+        supports_vision: false
+      - name: "openai/gpt-oss-120b:free"
+        display_name: "OpenAI GPT-OSS 120B (free)"
+        max_tokens: 32768
+        supports_streaming: true
+        supports_tools: true
+        supports_vision: false
+      - name: "google/gemma-3-27b-it:free"
+        display_name: "Google Gemma 3 27B (free)"
+        max_tokens: 8192
+        supports_streaming: true
+        supports_tools: false
+        supports_vision: false

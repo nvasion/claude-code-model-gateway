@@ -1,0 +1,632 @@
+# claude-code-model-gateway
+
+An HTTP model gateway and proxy service with multi-provider AI backend support. Routes requests to AI providers (Anthropic, OpenAI, Azure OpenAI, and custom endpoints) with production-grade reliability features: retry logic, caching, structured logging, and graceful error handling.
+
+## Features
+
+- **Multi-provider support** — Built-in configurations for Anthropic, OpenAI, and Azure OpenAI; add custom providers via YAML
+- **Model name aliasing** — Map Claude model IDs (e.g. `claude-sonnet-4-20250514`) to any provider model, so Claude Code works seamlessly with free/alternative backends
+- **Real-time SSE streaming** — Per-chunk forwarding via `read1()` ensures token-by-token streaming instead of buffered bursts
+- **Full header forwarding** — `anthropic-version` and `anthropic-beta` headers are forwarded to providers, enabling extended thinking, prompt caching, and other API features
+- **Retry & resilience** — Exponential, linear, and constant backoff strategies with circuit breaker support
+- **Request caching** — Thread-safe LRU cache with TTL for upstream responses
+- **Structured logging** — Standard, detailed, JSON, and colored log formats with per-request correlation IDs
+- **Configuration management** — YAML/JSON config files with environment variable overrides
+- **System service integration** — Ships with systemd and SysV init.d service definitions
+- **Comprehensive error handling** — Typed error hierarchy with retryable classification and HTTP status mapping
+
+## Requirements
+
+- Python 3.11+
+- `click >= 8.1.0`
+- `pyyaml >= 6.0`
+
+## Installation
+
+```bash
+# Install in editable mode (development)
+pip install -e .
+
+# Install with development dependencies
+pip install -e ".[dev]"
+
+# Install from requirements file
+pip install -r requirements.txt
+```
+
+## Quick Start
+
+```bash
+# Start the gateway on the default address (127.0.0.1:8080)
+claude-code-model-gateway gateway
+
+# Start on a custom port
+claude-code-model-gateway gateway --port 9090
+
+# Start with an explicit API key
+claude-code-model-gateway gateway --api-key sk-ant-...
+
+# Show help
+claude-code-model-gateway --help
+```
+
+## Using with Claude Code
+
+The gateway acts as a local reverse proxy, letting Claude Code traffic flow through it for logging, auditing, retry handling, and multi-provider model routing.
+
+### Mode 1 — Simple Anthropic passthrough (no config file needed)
+
+The gateway forwards all traffic transparently to `api.anthropic.com`. Use this when you only need Anthropic models and want retry/logging benefits without any extra setup.
+
+```bash
+# 1. Start the gateway (uses ANTHROPIC_API_KEY from environment automatically)
+claude-code-model-gateway gateway
+
+# 2. Point Claude Code at the gateway
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
+claude
+```
+
+### Mode 2 — Multi-provider routing with model aliasing (OpenRouter, OpenAI, local LLMs, …)
+
+Use a gateway config file to add third-party providers. `model_aliases` lets Claude Code send its normal Claude model names while the gateway transparently rewrites them to the provider models you configure. The `third-party-models` command lists every model and prints the exact commands to connect Claude Code.
+
+#### Step 1 — Create a config file
+
+```bash
+claude-code-model-gateway config init        # creates gateway.yaml with all built-in providers
+```
+
+Edit `gateway.yaml` to add your API keys and enable the providers you want:
+
+```yaml
+default_provider: openai
+
+providers:
+  openai:
+    enabled: true
+    api_key_env_var: "OPENAI_API_KEY"
+    models:
+      gpt-4o:
+        name: gpt-4o
+        display_name: GPT-4o
+        max_tokens: 16384
+        supports_streaming: true
+        supports_tools: true
+        supports_vision: true
+```
+
+#### Step 2 — Discover available models
+
+```bash
+claude-code-model-gateway third-party-models
+```
+
+This prints every model across all enabled providers along with the exact commands to start the gateway and connect Claude Code. Example output:
+
+```
+Third-Party Models via Gateway
+============================================================
+  Config:    gateway.yaml
+  Providers: 2 enabled  |  Models: 5 total
+
+  OpenAI (openai) (default)
+    gpt-4o  [tools, vision]
+    gpt-4o-mini  [tools, vision]
+
+  Anthropic (anthropic)
+    claude-sonnet-4-20250514  [tools, vision]
+
+────────────────────────────────────────────────────────────
+How to use these models in Claude Code
+────────────────────────────────────────────────────────────
+
+1. Start the gateway (in a separate terminal):
+
+       claude-code-model-gateway gateway --config gateway.yaml
+
+2. Point Claude Code at the gateway:
+
+       export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
+
+3. Switch models inside Claude Code using:
+
+       /model <model-id>
+
+   Example:  /model gpt-4o
+```
+
+#### Step 3 — Start the gateway and Claude Code
+
+```bash
+# Terminal 1 — start the gateway
+claude-code-model-gateway gateway --config gateway.yaml
+
+# Terminal 2 — start Claude Code pointed at the gateway
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
+claude
+```
+
+Then switch models at any time inside Claude Code with the `/model` picker:
+
+```
+/model gpt-4o
+/model claude-sonnet-4-20250514
+/model gpt-4o-mini
+```
+
+The gateway automatically routes each request to the correct upstream provider based on the model ID.
+
+### Verifying model alias remapping end-to-end
+
+```bash
+# Terminal 1: start the gateway (with OpenRouter free models)
+export OPENROUTER_API_KEY=<your-key>
+claude-code-model-gateway gateway --config gateway.yaml --verbose
+
+# Terminal 2: start Claude Code through the gateway
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
+export ANTHROPIC_API_KEY=placeholder   # any non-empty value
+claude
+```
+
+In the gateway logs you should see:
+
+```
+Remapping model claude-sonnet-4-20250514 -> arcee-ai/trinity-large-preview:free
+Forwarding POST /v1/messages to openrouter.ai/api/v1/messages (streaming=True)
+```
+
+Streaming responses arrive token-by-token in real time rather than in batched bursts.
+
+### What gets proxied
+
+The gateway transparently forwards all Anthropic API endpoints Claude Code uses:
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/v1/messages` | POST | Create a message (streaming and non-streaming) |
+| `/v1/messages/count_tokens` | POST | Count tokens for a request |
+| `/v1/models` | GET | List available models (served locally from config when present) |
+
+### One-liner (start gateway + Claude Code together)
+
+```bash
+claude-code-model-gateway gateway & ANTHROPIC_BASE_URL=http://127.0.0.1:8080 claude
+```
+
+### Useful gateway options for Claude Code
+
+| Option | Purpose |
+|---|---|
+| `--verbose` / `-v` | Log every request/response for debugging |
+| `--timeout 600` | Increase timeout for long-running tasks (default: 300s) |
+| `--max-retries 5` | More retries on transient API errors |
+| `--log-format json` | Structured JSON logs for log aggregation |
+| `--log-file gateway.log` | Write logs to a file alongside console output |
+
+Example with all options relevant to Claude Code:
+
+```bash
+claude-code-model-gateway gateway \
+  --config gateway.yaml \
+  --port 8080 \
+  --timeout 600 \
+  --max-retries 3 \
+  --verbose \
+  --log-format colored \
+  --log-file ~/.local/share/claude-gateway/gateway.log
+```
+
+## CLI Reference
+
+### `gateway` — Start the model gateway
+
+Launches a local HTTP server that accepts Anthropic-format requests and forwards them to Anthropic (default) or to the configured provider in a gateway config file.
+
+```
+claude-code-model-gateway gateway [OPTIONS]
+```
+
+| Option | Short | Default | Description |
+|---|---|---|---|
+| `--host` | `-H` | `127.0.0.1` | Host address to bind |
+| `--port` | `-p` | `8080` | Port to listen on |
+| `--timeout` | `-t` | `300` | Upstream connection timeout (seconds) |
+| `--api-key` | | `$ANTHROPIC_API_KEY` | Anthropic API key |
+| `--config` | `-c` | `$GATEWAY_CONFIG` | Path to gateway config YAML/JSON file |
+| `--anthropic-version` | | `2023-06-01` | Anthropic API version header |
+| `--max-retries` | | `2` | Retry attempts for failed non-streaming requests |
+| `--retry-delay` | | `1.0` | Base delay (seconds) between retries |
+| `--verbose` | `-v` | `false` | Enable DEBUG logging |
+| `--log-format` | | `standard` | Log format: `standard`, `detailed`, `json`, `colored`, `minimal` |
+| `--log-file` | | | Path to log file (enables file logging) |
+
+### `third-party-models` — Discover models and get Claude Code setup instructions
+
+Lists every model across all enabled providers and prints step-by-step instructions for connecting Claude Code to the gateway. This is the installed equivalent of the `/third-party-models` Claude Code slash command.
+
+```
+claude-code-model-gateway third-party-models [OPTIONS]
+```
+
+| Option | Short | Default | Description |
+|---|---|---|---|
+| `--config-file` | `-c` | `$GATEWAY_CONFIG` | Path to gateway config file (auto-detected from `gateway.yaml`) |
+| `--host` | | `127.0.0.1` | Gateway host (used in the `ANTHROPIC_BASE_URL` hint) |
+| `--port` | | `8080` | Gateway port (used in the `ANTHROPIC_BASE_URL` hint) |
+
+```bash
+claude-code-model-gateway third-party-models
+claude-code-model-gateway third-party-models --config-file gateway.yaml
+claude-code-model-gateway third-party-models --port 9090
+```
+
+### `proxy` — Start the HTTP forward proxy
+
+Launches a general-purpose HTTP forward proxy (not Anthropic-specific).
+
+```
+claude-code-model-gateway proxy [OPTIONS]
+```
+
+| Option | Short | Default | Description |
+|---|---|---|---|
+| `--host` | `-H` | `127.0.0.1` | Host address to bind |
+| `--port` | `-p` | `3000` | Port to listen on |
+| `--timeout` | `-t` | `30` | Upstream connection timeout (seconds) |
+| `--max-retries` | | `0` | Retry attempts (0 = no retries) |
+| `--retry-delay` | | `1.0` | Base delay (seconds) between retries |
+| `--verbose` | `-v` | `false` | Enable DEBUG logging |
+| `--log-format` | | `standard` | Log format |
+| `--log-file` | | | Path to log file |
+
+### `validate-config` — Comprehensive configuration validation
+
+Runs detailed validation with error, warning, and informational messages. Checks types, value ranges, cross-references, and best-practice recommendations.
+
+```
+claude-code-model-gateway validate-config [OPTIONS]
+```
+
+| Option | Short | Default | Description |
+|---|---|---|---|
+| `--config-file` | `-c` | | Path to config file (auto-discovered if omitted) |
+| `--format` | | `text` | Output format: `text` or `json` |
+| `--strict` | | `false` | Treat warnings as errors (exit 1 on warnings) |
+| `--show-info` | | `false` | Include informational messages in output |
+
+```bash
+claude-code-model-gateway validate-config
+claude-code-model-gateway validate-config -c gateway.yaml --strict
+claude-code-model-gateway validate-config --format json --show-info
+```
+
+### `config` — Manage configuration
+
+```bash
+# Initialise a new configuration file (with all built-in providers)
+claude-code-model-gateway config init
+
+# Display the active configuration
+claude-code-model-gateway config show
+claude-code-model-gateway config show --format yaml
+
+# Quick-validate the active configuration
+claude-code-model-gateway config validate
+
+# Set a top-level config value (default_provider, log_level, timeout, max_retries)
+claude-code-model-gateway config set default_provider openai
+claude-code-model-gateway config set timeout 60
+```
+
+### `provider` — Manage model providers
+
+```bash
+# List configured providers
+claude-code-model-gateway provider list
+
+# List built-in provider templates
+claude-code-model-gateway provider list --builtins
+
+# Show details for a specific provider
+claude-code-model-gateway provider show openai
+
+# Add a provider (from scratch or from a built-in template)
+claude-code-model-gateway provider add my-openai --api-base https://api.openai.com/v1 --api-key-env OPENAI_API_KEY
+claude-code-model-gateway provider add local-llm --api-base http://localhost:8000/v1 --default-model llama3
+claude-code-model-gateway provider add my-gpt --from-builtin openai
+
+# Remove a provider
+claude-code-model-gateway provider remove my-openai
+
+# Set the default provider
+claude-code-model-gateway provider set-default anthropic
+
+# Enable / disable a provider
+claude-code-model-gateway provider enable openai
+claude-code-model-gateway provider disable openai
+```
+
+### `models` — List and inspect models
+
+```bash
+# List all models across all enabled providers
+claude-code-model-gateway models list
+
+# Filter to a specific provider
+claude-code-model-gateway models list --provider openai
+
+# JSON output (useful for scripting)
+claude-code-model-gateway models list --format json
+
+# Show full details for a specific model
+claude-code-model-gateway models show gpt-4o
+claude-code-model-gateway models show claude-sonnet-4-20250514
+```
+
+### Utility commands
+
+```bash
+# Print a greeting
+claude-code-model-gateway hello
+
+# Greet a specific name
+claude-code-model-gateway greet Alice
+
+# Show application version
+claude-code-model-gateway version
+claude-code-model-gateway --version
+```
+
+## Configuration
+
+The gateway looks for a configuration file in the following locations (in order):
+
+1. Path passed via `--config` / `GATEWAY_CONFIG` environment variable
+2. `./gateway.yaml` / `./gateway.yml` / `./gateway.json`
+3. `~/.config/claude-code-model-gateway/gateway.yaml`
+
+### Example `gateway.yaml`
+
+```yaml
+# Default provider when none is specified in the request
+default_provider: openrouter
+
+# Model name aliases
+# Map Claude Code's fixed model names to the provider models you want to use.
+# The gateway rewrites the model field in the request body before forwarding,
+# and exposes alias names through /v1/models so Claude Code's /model picker
+# shows them as selectable options.
+model_aliases:
+  "claude-sonnet-4-20250514": "arcee-ai/trinity-large-preview:free"
+  "claude-sonnet-4-6-20250514": "arcee-ai/trinity-large-preview:free"
+  "claude-opus-4-20250514": "openai/gpt-oss-120b:free"
+  "claude-haiku-3-5-20241022": "google/gemma-3-27b-it:free"
+
+log_level: info
+timeout: 300
+max_retries: 3
+
+providers:
+  openrouter:
+    enabled: true
+    api_base: "https://openrouter.ai/api/v1"
+    api_key_env_var: "OPENROUTER_API_KEY"
+    auth_type: "bearer_token"
+    models:
+      - name: "arcee-ai/trinity-large-preview:free"
+        display_name: "Arcee Trinity Large (free)"
+        max_tokens: 32768
+        supports_streaming: true
+        supports_tools: true
+      - name: "openai/gpt-oss-120b:free"
+        display_name: "OpenAI GPT-OSS 120B (free)"
+        max_tokens: 32768
+        supports_streaming: true
+        supports_tools: true
+      - name: "google/gemma-3-27b-it:free"
+        display_name: "Google Gemma 3 27B (free)"
+        max_tokens: 8192
+        supports_streaming: true
+```
+
+### `model_aliases` — transparent model name remapping
+
+Claude Code always sends requests with Anthropic model IDs (`claude-sonnet-4-20250514`, etc.). Without aliases, those names are forwarded verbatim to the upstream provider, which may charge for the real Claude models or reject the request.
+
+`model_aliases` tells the gateway to rewrite the model name in the request body **before** forwarding:
+
+```yaml
+model_aliases:
+  "claude-sonnet-4-20250514": "arcee-ai/trinity-large-preview:free"
+```
+
+With this configuration:
+1. Claude Code sends `"model": "claude-sonnet-4-20250514"`
+2. The gateway rewrites it to `"model": "arcee-ai/trinity-large-preview:free"`
+3. OpenRouter receives the free model name and routes accordingly
+
+**`/v1/models` picker support** — Aliased names are also included in the `/v1/models` response, so Claude Code's `/model` command shows both the provider's native IDs and the familiar Claude names. Each alias entry has a `display_name` like `claude-sonnet-4-20250514 → arcee-ai/trinity-large-preview:free` to make the mapping visible.
+
+**Validation** — At startup, the config validator ensures alias keys do not collide with real provider model names (which would make the original model unreachable).
+
+### Environment variable overrides
+
+All configuration values can be overridden at runtime with environment variables:
+
+| Variable | Description |
+|---|---|
+| `GATEWAY_HOST` | Bind address |
+| `GATEWAY_PORT` | Listen port |
+| `GATEWAY_TIMEOUT` | Upstream timeout (seconds) |
+| `GATEWAY_LOG_LEVEL` | Log level |
+| `GATEWAY_LOG_FORMAT` | Log format |
+| `GATEWAY_LOG_FILE` | Log file path |
+| `GATEWAY_CONFIG` | Path to configuration file |
+| `GATEWAY_DEFAULT_PROVIDER` | Default provider name |
+| `GATEWAY_MAX_RETRIES` | Max retry attempts |
+| `ANTHROPIC_API_KEY` | Anthropic API key |
+| `OPENAI_API_KEY` | OpenAI API key |
+| `AZURE_OPENAI_API_KEY` | Azure OpenAI API key |
+
+## Built-in Providers
+
+| Provider | Example Models |
+|---|---|
+| **Anthropic** | Claude Sonnet 4, Claude Opus 4 |
+| **OpenAI** | gpt-4o, gpt-4-turbo, o1, o3-mini |
+| **Azure OpenAI** | Configurable Azure deployment endpoint |
+| **Google** | Gemini models (configurable) |
+| **AWS Bedrock** | Configurable Bedrock endpoint |
+
+Run `claude-code-model-gateway provider list --builtins` to see all built-in provider templates.
+
+## Running as a System Service
+
+The package ships with service definitions for both systemd and SysV init.d.
+
+### systemd
+
+```bash
+# Copy service files
+sudo cp service/systemd/claude-code-model-gateway.service /etc/systemd/system/
+sudo cp service/systemd/claude-code-model-gateway.sysusers /usr/lib/sysusers.d/
+sudo cp service/systemd/claude-code-model-gateway.tmpfiles /usr/lib/tmpfiles.d/
+
+# Copy configuration
+sudo mkdir -p /etc/claude-code-model-gateway
+sudo cp service/conf/gateway.yaml /etc/claude-code-model-gateway/gateway.yaml
+sudo cp service/conf/environment  /etc/claude-code-model-gateway/environment
+
+# Add API keys (protect this file — it contains secrets)
+sudo chmod 640 /etc/claude-code-model-gateway/environment
+sudo nano /etc/claude-code-model-gateway/environment
+
+# Enable and start
+sudo systemctl daemon-reload
+sudo systemctl enable --now claude-code-model-gateway
+```
+
+The service can also be installed and uninstalled with the provided scripts:
+
+```bash
+sudo bash scripts/install.sh
+sudo bash scripts/uninstall.sh
+```
+
+### Service entry point
+
+A dedicated service entry point is registered separately from the CLI:
+
+```bash
+claude-code-model-gateway-service   # runs src/service.py
+```
+
+It reads all settings from environment variables and handles `SIGTERM`, `SIGINT`, and `SIGHUP` for graceful shutdown and configuration reload.
+
+## Project Structure
+
+```
+claude-code-model-gateway/
+├── src/
+│   ├── __init__.py              # Package version
+│   ├── main.py                  # CLI entry point
+│   ├── cli.py                   # Click command definitions
+│   ├── service.py               # Service daemon (SIGTERM/SIGHUP handling)
+│   ├── proxy.py                 # HTTP proxy server
+│   ├── providers.py             # Built-in provider definitions
+│   ├── models.py                # GatewayConfig, ProviderConfig, ModelConfig
+│   ├── errors.py                # Typed error hierarchy
+│   ├── retry.py                 # Retry logic & backoff strategies
+│   ├── cache.py                 # LRU cache with TTL
+│   ├── logging_config.py        # Structured logging setup
+│   ├── anthropic_passthrough.py # Anthropic-specific passthrough logic
+│   ├── config/                  # Configuration loading & validation
+│   │   ├── __init__.py
+│   │   ├── loader.py
+│   │   ├── schema.py
+│   │   ├── validator.py
+│   │   └── testing.py
+│   └── validation/              # Request validation
+│       ├── __init__.py
+│       ├── validator.py
+│       └── testing.py
+├── tests/                       # pytest test suite
+│   ├── test_cli.py
+│   ├── test_cli_config.py
+│   ├── test_cli_validation.py
+│   ├── test_cache.py
+│   ├── test_config.py
+│   ├── test_errors.py
+│   ├── test_logging.py
+│   ├── test_models.py
+│   ├── test_proxy.py
+│   ├── test_providers.py
+│   ├── test_retry.py
+│   ├── test_service.py
+│   ├── test_validator.py
+│   └── ...
+├── service/
+│   ├── conf/
+│   │   ├── gateway.yaml         # Configuration template
+│   │   └── environment          # Environment variable template
+│   ├── systemd/                 # systemd unit files
+│   └── initd/                   # SysV init.d script
+├── scripts/
+│   ├── install.sh
+│   ├── uninstall.sh
+│   └── healthcheck.sh
+├── Dockerfile
+├── docker-compose.yaml
+├── pyproject.toml
+├── requirements.txt
+└── README.md
+```
+
+## Development
+
+```bash
+# Install with development dependencies
+pip install -e ".[dev]"
+
+# Run all tests
+pytest
+
+# Run with verbose output
+pytest -v
+
+# Run with coverage report
+pytest --cov=src
+
+# Run a specific test
+pytest -k test_name
+
+# Format code
+black src tests
+
+# Lint
+ruff check src tests
+
+# Auto-fix lint issues
+ruff check --fix src tests
+```
+
+### Writing tests
+
+Tests use `pytest` and Click's `CliRunner`:
+
+```python
+from click.testing import CliRunner
+from src.cli import main
+
+def test_my_command():
+    runner = CliRunner()
+    result = runner.invoke(main, ["gateway", "--help"])
+    assert result.exit_code == 0
+    assert "--host" in result.output
+```
+
+## License
+
+MIT

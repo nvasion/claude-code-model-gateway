@@ -1,0 +1,108 @@
+#!/sbin/openrc-run
+# ---------------------------------------------------------------------------
+# OpenRC init script — claude-code-model-gateway
+# ---------------------------------------------------------------------------
+# Compatible with: Alpine Linux, Gentoo, and any OpenRC-based distribution.
+#
+# Installation:
+#   cp service/openrc/claude-code-model-gateway /etc/init.d/
+#   chmod 755 /etc/init.d/claude-code-model-gateway
+#   rc-update add claude-code-model-gateway default
+#   rc-service claude-code-model-gateway start
+#
+# Management:
+#   rc-service claude-code-model-gateway {start|stop|restart|reload|status}
+#   rc-update {add|del} claude-code-model-gateway {default|boot}
+# ---------------------------------------------------------------------------
+
+description="Claude Code Model Gateway — HTTP model gateway/proxy service"
+extra_commands="healthcheck"
+extra_started_commands="reload"
+
+# Paths
+NAME="claude-code-model-gateway"
+DAEMON="/opt/claude-code-model-gateway/venv/bin/claude-code-model-gateway"
+PIDFILE="/var/run/${NAME}/${NAME}.pid"
+LOGFILE="/var/log/${NAME}/gateway.log"
+CONFIG_DIR="/etc/${NAME}"
+ENV_FILE="${CONFIG_DIR}/environment"
+
+# Run-as user (created by install.sh)
+command_user="${SERVICE_USER:-claude-gateway}"
+
+# Load environment overrides if the file exists
+if [ -f "${ENV_FILE}" ]; then
+    # shellcheck source=/dev/null
+    . "${ENV_FILE}"
+fi
+
+# Apply defaults for variables that may not be set in the env file
+GATEWAY_HOST="${GATEWAY_HOST:-0.0.0.0}"
+GATEWAY_PORT="${GATEWAY_PORT:-8080}"
+GATEWAY_TIMEOUT="${GATEWAY_TIMEOUT:-300}"
+GATEWAY_LOG_FORMAT="${GATEWAY_LOG_FORMAT:-json}"
+GATEWAY_LOG_FILE="${GATEWAY_LOG_FILE:-${LOGFILE}}"
+
+# openrc-run variables
+command="${DAEMON}"
+command_args="gateway
+    --host ${GATEWAY_HOST}
+    --port ${GATEWAY_PORT}
+    --timeout ${GATEWAY_TIMEOUT}
+    --log-format ${GATEWAY_LOG_FORMAT}
+    --log-file ${GATEWAY_LOG_FILE}"
+command_background="yes"
+pidfile="${PIDFILE}"
+
+# Depend on network and logger
+depend() {
+    need net
+    use logger
+    after firewall
+}
+
+# Pre-start: ensure runtime directories exist with correct ownership
+start_pre() {
+    checkpath --directory --owner "${command_user}:${command_user}" \
+        --mode 0750 "/var/run/${NAME}"
+    checkpath --directory --owner "${command_user}:${command_user}" \
+        --mode 0750 "/var/log/${NAME}"
+    checkpath --directory --owner "${command_user}:${command_user}" \
+        --mode 0750 "/var/lib/${NAME}"
+
+    # Verify the daemon binary exists
+    if [ ! -x "${DAEMON}" ]; then
+        eerror "Daemon not found or not executable: ${DAEMON}"
+        eerror "Run: sudo ./scripts/install.sh"
+        return 1
+    fi
+}
+
+# Reload: send SIGHUP to reload configuration without full restart
+reload() {
+    ebegin "Reloading ${description} configuration"
+    if [ -f "${pidfile}" ]; then
+        kill -HUP "$(cat "${pidfile}")" 2>/dev/null
+        eend $?
+    else
+        eend 1 "Service is not running"
+    fi
+}
+
+# Health check: verify the service is accepting connections
+healthcheck() {
+    ebegin "Checking ${description} health"
+    if python3 -c "
+import socket, sys
+try:
+    s = socket.create_connection(('${GATEWAY_HOST}', ${GATEWAY_PORT}), timeout=5)
+    s.close()
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+" 2>/dev/null; then
+        eend 0 "OK — listening on ${GATEWAY_HOST}:${GATEWAY_PORT}"
+    else
+        eend 1 "FAIL — not responding on ${GATEWAY_HOST}:${GATEWAY_PORT}"
+    fi
+}

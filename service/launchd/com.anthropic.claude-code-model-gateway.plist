@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd plist — claude-code-model-gateway (macOS)
+  ===================================================
+  System-wide service (LaunchDaemon), run as root → drops to _claude-gateway.
+
+  Installation:
+    sudo cp service/launchd/com.anthropic.claude-code-model-gateway.plist \
+             /Library/LaunchDaemons/
+    sudo launchctl bootstrap system \
+             /Library/LaunchDaemons/com.anthropic.claude-code-model-gateway.plist
+
+  Management:
+    sudo launchctl kickstart  system/com.anthropic.claude-code-model-gateway
+    sudo launchctl kill TERM  system/com.anthropic.claude-code-model-gateway
+    sudo launchctl bootout    system/com.anthropic.claude-code-model-gateway
+    sudo launchctl print      system/com.anthropic.claude-code-model-gateway
+
+  Logs (macOS unified logging):
+    log show --predicate 'subsystem == "com.anthropic.claude-code-model-gateway"' --last 1h
+    log stream --predicate 'subsystem == "com.anthropic.claude-code-model-gateway"'
+-->
+<plist version="1.0">
+<dict>
+
+    <!-- Service identity -->
+    <key>Label</key>
+    <string>com.anthropic.claude-code-model-gateway</string>
+
+    <key>BundleIdentifier</key>
+    <string>com.anthropic.claude-code-model-gateway</string>
+
+    <!-- Run at load / boot -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <!-- Restart unless user explicitly stops it -->
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Throttle rapid restarts: wait 5 s before re-launching -->
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <!-- Command and arguments -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/claude-code-model-gateway/venv/bin/claude-code-model-gateway</string>
+        <string>gateway</string>
+        <string>--host</string>
+        <string>0.0.0.0</string>
+        <string>--port</string>
+        <string>8080</string>
+        <string>--timeout</string>
+        <string>300</string>
+        <string>--log-format</string>
+        <string>json</string>
+        <string>--log-file</string>
+        <string>/var/log/claude-code-model-gateway/gateway.log</string>
+    </array>
+
+    <!-- Working directory -->
+    <key>WorkingDirectory</key>
+    <string>/opt/claude-code-model-gateway</string>
+
+    <!-- Environment variables
+         Override here or set ANTHROPIC_API_KEY in /etc/claude-code-model-gateway/environment
+         and source it in your shell / set via launchctl setenv. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>GATEWAY_HOST</key>
+        <string>0.0.0.0</string>
+        <key>GATEWAY_PORT</key>
+        <string>8080</string>
+        <key>GATEWAY_TIMEOUT</key>
+        <string>300</string>
+        <key>GATEWAY_LOG_FORMAT</key>
+        <string>json</string>
+        <key>GATEWAY_LOG_FILE</key>
+        <string>/var/log/claude-code-model-gateway/gateway.log</string>
+        <key>GATEWAY_LOG_LEVEL</key>
+        <string>info</string>
+    </dict>
+
+    <!-- stdout / stderr (before the app opens its own log file) -->
+    <key>StandardOutPath</key>
+    <string>/var/log/claude-code-model-gateway/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/claude-code-model-gateway/stderr.log</string>
+
+    <!-- Resource limits -->
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+
+    <!-- Process type hint (background daemon) -->
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <!-- Low I/O priority to avoid impacting interactive use -->
+    <key>LowPriorityIO</key>
+    <false/>
+
+    <!-- Sockets — declare the listening port so launchd can activate the
+         service on first connection (optional; remove if not using socket
+         activation). -->
+    <!--
+    <key>Sockets</key>
+    <dict>
+        <key>GatewaySocket</key>
+        <dict>
+            <key>SockType</key>
+            <string>stream</string>
+            <key>SockFamily</key>
+            <string>IPv4v6</string>
+            <key>SockServiceName</key>
+            <string>8080</string>
+        </dict>
+    </dict>
+    -->
+
+</dict>
+</plist>
