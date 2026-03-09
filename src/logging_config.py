@@ -45,6 +45,7 @@ import json
 import logging
 import logging.handlers
 import os
+import re
 import sys
 import threading
 import time
@@ -1189,3 +1190,988 @@ def get_logging_status() -> dict[str, Any]:
         status["config"] = _active_config.to_dict()
 
     return status
+
+
+# ---------------------------------------------------------------------------
+# SensitiveDataFilter
+# ---------------------------------------------------------------------------
+
+_DEFAULT_SENSITIVE_PATTERNS = [
+    re.compile(r"sk-ant-[A-Za-z0-9\-_]+"),
+    re.compile(r"sk-[A-Za-z0-9]{10,}"),
+    re.compile(r"(?i)api[_\-]?key\s*[=:]\s*\S+"),
+    re.compile(r"(?i)Bearer\s+\S+"),
+    re.compile(r"(?i)password\s*[=:]\s*\S+"),
+    re.compile(r"(?i)x-api-key\s*[=:]\s*\S+"),
+    re.compile(r"(?i)secret\s*[=:]\s*\S+"),
+    re.compile(r"(?i)token\s*[=:]\s*\S+"),
+]
+
+_SENSITIVE_EXTRA_KEYS = frozenset(
+    {"api_key", "password", "secret", "token", "auth", "bearer", "key"}
+)
+
+
+class SensitiveDataFilter(logging.Filter):
+    """Filter that redacts sensitive data from log records.
+
+    Scans log message text (and optionally extra fields) for patterns
+    matching API keys, passwords, Bearer tokens, and similar secrets,
+    replacing them with a configurable placeholder.
+
+    Args:
+        patterns: List of compiled regex patterns (or raw strings) to redact.
+            Defaults to the built-in set of common secret patterns.
+        replacement: Replacement text used in the message.  Defaults to
+            ``"REDACTED"``.
+        redact_extras: Whether to also redact extra fields whose *names*
+            match common sensitive-key names.  Defaults to ``True``.
+    """
+
+    def __init__(
+        self,
+        patterns: Optional[list] = None,
+        replacement: str = "REDACTED",
+        redact_extras: bool = True,
+    ) -> None:
+        super().__init__()
+        if patterns is None:
+            self._patterns = _DEFAULT_SENSITIVE_PATTERNS
+        else:
+            compiled: list = []
+            for p in patterns:
+                if isinstance(p, str):
+                    compiled.append(re.compile(p))
+                else:
+                    compiled.append(p)
+            self._patterns = compiled
+        self._replacement = replacement
+        self._redact_extras = redact_extras
+
+    def _redact(self, text: str) -> str:
+        """Apply all redaction patterns to *text*."""
+        for pattern in self._patterns:
+            text = pattern.sub(self._replacement, text)
+        return text
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Redact sensitive data from the record in-place."""
+        # Redact message
+        record.msg = self._redact(str(record.msg))
+
+        # Redact args
+        if isinstance(record.args, tuple):
+            record.args = tuple(
+                self._redact(str(a)) if isinstance(a, str) else a
+                for a in record.args
+            )
+        elif isinstance(record.args, dict):
+            record.args = {
+                k: self._redact(str(v)) if isinstance(v, str) else v
+                for k, v in record.args.items()
+            }
+
+        # Redact sensitive extra fields by key name
+        if self._redact_extras:
+            for attr_name in list(record.__dict__.keys()):
+                if attr_name.lower() in _SENSITIVE_EXTRA_KEYS:
+                    setattr(record, attr_name, "***REDACTED***")
+
+        return True
+
+
+# ---------------------------------------------------------------------------
+# SamplingFilter
+# ---------------------------------------------------------------------------
+
+
+class SamplingFilter(logging.Filter):
+    """Filter that probabilistically samples log records by level.
+
+    Messages at levels in *always_pass_levels* (defaults to ERROR and
+    CRITICAL) are always passed through.  For other levels a random
+    draw against the configured *rate* decides whether the record is
+    passed or suppressed.
+
+    Args:
+        rates: Mapping of level name → probability in [0.0, 1.0].
+        default_rate: Rate for levels not in *rates*.  Defaults to 1.0.
+        always_pass_levels: Set of level names that are never sampled.
+            Defaults to ``{"ERROR", "CRITICAL"}``.
+    """
+
+    def __init__(
+        self,
+        rates: Optional[dict[str, float]] = None,
+        default_rate: float = 1.0,
+        always_pass_levels: Optional[set] = None,
+    ) -> None:
+        super().__init__()
+        self._rates: dict[str, float] = rates or {}
+        self._default_rate = default_rate
+        self._always_pass: set = (
+            always_pass_levels
+            if always_pass_levels is not None
+            else {"ERROR", "CRITICAL"}
+        )
+        self._lock = threading.Lock()
+        self._total_count = 0
+        self._passed_count = 0
+        self._suppressed_by_level: dict[str, int] = {}
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Sample the record according to its level's configured rate."""
+        import random
+
+        level_name = record.levelname
+        with self._lock:
+            self._total_count += 1
+
+            if level_name in self._always_pass:
+                self._passed_count += 1
+                return True
+
+            rate = self._rates.get(level_name, self._default_rate)
+            if random.random() < rate:
+                self._passed_count += 1
+                return True
+            else:
+                self._suppressed_by_level[level_name] = (
+                    self._suppressed_by_level.get(level_name, 0) + 1
+                )
+                return False
+
+    def get_stats(self) -> dict[str, Any]:
+        """Return sampling statistics."""
+        with self._lock:
+            return {
+                "total_count": self._total_count,
+                "passed_count": self._passed_count,
+                "suppressed_by_level": dict(self._suppressed_by_level),
+            }
+
+    def reset_stats(self) -> None:
+        """Reset all sampling statistics."""
+        with self._lock:
+            self._total_count = 0
+            self._passed_count = 0
+            self._suppressed_by_level = {}
+
+
+# ---------------------------------------------------------------------------
+# LogMetrics
+# ---------------------------------------------------------------------------
+
+
+class LogMetrics:
+    """Collects aggregate metrics about log output.
+
+    Tracks message counts by level and module, recent error details,
+    and provides an error-rate calculation over a configurable window.
+
+    Args:
+        window_seconds: Size of the sliding time-window used for the
+            error-rate calculation.  Defaults to 60 seconds.
+    """
+
+    def __init__(self, window_seconds: float = 60.0) -> None:
+        self._window_seconds = window_seconds
+        self._lock = threading.Lock()
+        self._total_count = 0
+        self._levels: dict[str, int] = {}
+        self._modules: dict[str, int] = {}
+        self._recent_errors: list[dict[str, Any]] = []
+        self._max_recent_errors = 100
+        self._error_timestamps: list[float] = []
+        self._start_time = time.monotonic()
+
+    def record(self, record: logging.LogRecord) -> None:
+        """Record a log message in the metrics."""
+        with self._lock:
+            self._total_count += 1
+            level_name = record.levelname
+            self._levels[level_name] = self._levels.get(level_name, 0) + 1
+            self._modules[record.name] = self._modules.get(record.name, 0) + 1
+
+            if record.levelno >= logging.ERROR:
+                now = time.monotonic()
+                self._error_timestamps.append(now)
+                # Trim timestamps outside the window
+                cutoff = now - self._window_seconds
+                self._error_timestamps = [
+                    t for t in self._error_timestamps if t >= cutoff
+                ]
+
+                error_entry: dict[str, Any] = {
+                    "message": record.getMessage(),
+                    "module": record.name,
+                    "timestamp": record.created,
+                }
+                if record.exc_info and record.exc_info[0] is not None:
+                    error_entry["exception_type"] = record.exc_info[0].__name__
+                self._recent_errors.append(error_entry)
+                if len(self._recent_errors) > self._max_recent_errors:
+                    self._recent_errors = self._recent_errors[
+                        -self._max_recent_errors:
+                    ]
+
+    def get_report(self) -> dict[str, Any]:
+        """Return a snapshot of current metrics."""
+        with self._lock:
+            return {
+                "total_count": self._total_count,
+                "levels": dict(self._levels),
+                "top_modules": dict(self._modules),
+                "recent_errors": list(self._recent_errors),
+                "uptime_seconds": time.monotonic() - self._start_time,
+            }
+
+    def get_error_rate(self) -> float:
+        """Return the error rate (errors per minute) over the time window."""
+        with self._lock:
+            now = time.monotonic()
+            cutoff = now - self._window_seconds
+            recent = [t for t in self._error_timestamps if t >= cutoff]
+            return len(recent) * 60.0 / self._window_seconds
+
+    def reset(self) -> None:
+        """Reset all collected metrics."""
+        with self._lock:
+            self._total_count = 0
+            self._levels = {}
+            self._modules = {}
+            self._recent_errors = []
+            self._error_timestamps = []
+            self._start_time = time.monotonic()
+
+
+class LogMetricsHandler(logging.Handler):
+    """Logging handler that feeds records into a :class:`LogMetrics` instance.
+
+    Args:
+        metrics: The LogMetrics instance to record into.
+    """
+
+    def __init__(self, metrics: LogMetrics) -> None:
+        super().__init__()
+        self.metrics = metrics
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """Record the log entry in the metrics."""
+        self.metrics.record(record)
+
+
+# Global LogMetrics instance
+_global_metrics: Optional["LogMetrics"] = None
+
+
+def get_log_metrics() -> LogMetrics:
+    """Return (or lazily create) the global LogMetrics instance.
+
+    Returns:
+        The singleton LogMetrics for the process.
+    """
+    global _global_metrics
+    if _global_metrics is None:
+        _global_metrics = LogMetrics()
+    return _global_metrics
+
+
+def reset_log_metrics() -> None:
+    """Discard the current global LogMetrics instance.
+
+    The next call to :func:`get_log_metrics` will create a fresh instance.
+    Primarily useful for testing.
+    """
+    global _global_metrics
+    _global_metrics = None
+
+
+# ---------------------------------------------------------------------------
+# StructuredLogger
+# ---------------------------------------------------------------------------
+
+
+class StructuredLogger:
+    """A structured-logging wrapper around a standard :class:`logging.Logger`.
+
+    Allows default fields to be bound once and injected into every subsequent
+    log call without repeating them at every call site.
+
+    Args:
+        name: Logger name (passed to :func:`get_logger`).
+        default_fields: Key/value pairs injected into every log record's
+            ``extra`` dict.  Not required at construction time.
+
+    Example::
+
+        log = StructuredLogger("my_module")
+        req_log = log.bind(request_id="abc-123", user="alice")
+        req_log.info("Processing request", endpoint="/v1/messages")
+    """
+
+    def __init__(
+        self,
+        name: str,
+        default_fields: Optional[dict[str, Any]] = None,
+    ) -> None:
+        self._module_name = name
+        self._logger = get_logger(name)
+        self._default_fields: dict[str, Any] = dict(default_fields or {})
+
+    @property
+    def name(self) -> str:
+        """The fully-qualified logger name."""
+        return self._logger.name
+
+    def bind(self, **kwargs: Any) -> "StructuredLogger":
+        """Return a new StructuredLogger with additional default fields.
+
+        Args:
+            **kwargs: Fields to add (or override) in the new logger.
+
+        Returns:
+            A child StructuredLogger with the merged default fields.
+        """
+        new_fields = {**self._default_fields, **kwargs}
+        child = StructuredLogger.__new__(StructuredLogger)
+        child._module_name = self._module_name
+        child._logger = self._logger
+        child._default_fields = new_fields
+        return child
+
+    def unbind(self, *keys: str) -> "StructuredLogger":
+        """Return a new StructuredLogger with specified fields removed.
+
+        Args:
+            *keys: Field names to remove from the default fields.
+
+        Returns:
+            A child StructuredLogger without the specified fields.
+        """
+        new_fields = {
+            k: v for k, v in self._default_fields.items() if k not in keys
+        }
+        child = StructuredLogger.__new__(StructuredLogger)
+        child._module_name = self._module_name
+        child._logger = self._logger
+        child._default_fields = new_fields
+        return child
+
+    def _extra(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        return {**self._default_fields, **kwargs}
+
+    def debug(self, msg: str, **kwargs: Any) -> None:
+        """Log at DEBUG level."""
+        self._logger.debug(msg, extra=self._extra(kwargs))
+
+    def info(self, msg: str, **kwargs: Any) -> None:
+        """Log at INFO level."""
+        self._logger.info(msg, extra=self._extra(kwargs))
+
+    def warning(self, msg: str, **kwargs: Any) -> None:
+        """Log at WARNING level."""
+        self._logger.warning(msg, extra=self._extra(kwargs))
+
+    def error(self, msg: str, **kwargs: Any) -> None:
+        """Log at ERROR level."""
+        self._logger.error(msg, extra=self._extra(kwargs))
+
+    def critical(self, msg: str, **kwargs: Any) -> None:
+        """Log at CRITICAL level."""
+        self._logger.critical(msg, extra=self._extra(kwargs))
+
+    def exception(self, msg: str, **kwargs: Any) -> None:
+        """Log at ERROR level, capturing current exception info."""
+        self._logger.exception(msg, extra=self._extra(kwargs))
+
+    def log(self, level: int, msg: str, **kwargs: Any) -> None:
+        """Log at an arbitrary numeric level."""
+        self._logger.log(level, msg, extra=self._extra(kwargs))
+
+
+# ---------------------------------------------------------------------------
+# Request context
+# ---------------------------------------------------------------------------
+
+_request_context_var: contextvars.ContextVar[Optional[dict[str, Any]]] = (
+    contextvars.ContextVar("request_context", default=None)
+)
+
+
+def set_request_context(ctx: dict[str, Any]) -> dict[str, Any]:
+    """Set the request context for the current async/thread context.
+
+    Args:
+        ctx: Dictionary of request metadata (e.g. method, path, request_id).
+
+    Returns:
+        The context dictionary that was set.
+    """
+    _request_context_var.set(ctx)
+    return ctx
+
+
+def get_request_context() -> Optional[dict[str, Any]]:
+    """Get the current request context, or None if not set.
+
+    Returns:
+        The current request context dictionary, or None.
+    """
+    return _request_context_var.get()
+
+
+def clear_request_context() -> None:
+    """Clear the current request context."""
+    _request_context_var.set(None)
+
+
+def update_request_context(**kwargs: Any) -> dict[str, Any]:
+    """Update (or create) the current request context with new fields.
+
+    Args:
+        **kwargs: Fields to add or update.
+
+    Returns:
+        The updated request context dictionary.
+    """
+    existing = _request_context_var.get() or {}
+    updated = {**existing, **kwargs}
+    _request_context_var.set(updated)
+    return updated
+
+
+@contextmanager
+def request_context(**kwargs: Any):
+    """Context manager that sets up a correlated request context.
+
+    Sets a correlation ID, stores all kwargs as the request context
+    (adding ``correlation_id`` automatically), and cleans up on exit.
+
+    Args:
+        **kwargs: Arbitrary request metadata.  A ``correlation_id`` key
+            can be passed to use a specific ID instead of a generated one.
+
+    Yields:
+        Tuple of ``(correlation_id, context_dict)``.
+
+    Example::
+
+        with request_context(method="POST", path="/v1/messages") as (cid, ctx):
+            logger.info("Handling %s %s", ctx["method"], ctx["path"])
+    """
+    correlation_id = kwargs.pop("correlation_id", None)
+    cid = set_correlation_id(correlation_id)
+    ctx: dict[str, Any] = dict(kwargs)
+    ctx["correlation_id"] = cid
+    set_request_context(ctx)
+    try:
+        yield cid, ctx
+    finally:
+        clear_request_context()
+        clear_correlation_id()
+
+
+# ---------------------------------------------------------------------------
+# RequestContextFilter
+# ---------------------------------------------------------------------------
+
+_STANDARD_LOG_ATTRS: frozenset = frozenset(
+    {
+        "name", "msg", "args", "created", "relativeCreated", "exc_info",
+        "exc_text", "stack_info", "lineno", "funcName", "levelno", "levelname",
+        "pathname", "filename", "module", "thread", "threadName", "process",
+        "processName", "msecs", "message", "taskName",
+    }
+)
+
+
+class RequestContextFilter(logging.Filter):
+    """Filter that injects current request context into log records.
+
+    Any fields present in the active request context (set via
+    :func:`set_request_context`) are attached to each log record so
+    they are available to formatters and downstream handlers.
+
+    Standard :class:`logging.LogRecord` attributes are never overwritten.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Inject request context fields into *record*."""
+        ctx = get_request_context()
+        if ctx:
+            for key, value in ctx.items():
+                if key not in _STANDARD_LOG_ATTRS:
+                    setattr(record, key, value)
+        return True
+
+
+# ---------------------------------------------------------------------------
+# LogBuffer / BufferedHandler
+# ---------------------------------------------------------------------------
+
+_STANDARD_RECORD_DICT_ATTRS: frozenset = frozenset(
+    {
+        "name", "msg", "args", "created", "relativeCreated", "exc_info",
+        "exc_text", "stack_info", "lineno", "funcName", "levelno", "levelname",
+        "pathname", "filename", "module", "thread", "threadName", "process",
+        "processName", "msecs", "message", "taskName",
+    }
+)
+
+
+class LogBuffer:
+    """Thread-safe buffer for log records.
+
+    Accumulates records as serialisable dictionaries.  When the buffer
+    reaches *max_size* it either auto-flushes (if *on_flush* is set) or
+    drops subsequent records.
+
+    Args:
+        max_size: Maximum number of entries before auto-flush or drop.
+        on_flush: Callback invoked with a list of entry dicts on flush.
+    """
+
+    def __init__(
+        self,
+        max_size: int = 1000,
+        on_flush: Optional[Callable[[list], None]] = None,
+    ) -> None:
+        self._max_size = max_size
+        self._on_flush = on_flush
+        self._entries: list[dict[str, Any]] = []
+        self._lock = threading.Lock()
+        self._total_flushed = 0
+        self._total_dropped = 0
+
+    @property
+    def size(self) -> int:
+        """Current number of buffered entries."""
+        with self._lock:
+            return len(self._entries)
+
+    def add(self, record: logging.LogRecord) -> bool:
+        """Add a log record to the buffer.
+
+        Returns:
+            ``True`` if the record was buffered (or the buffer was
+            auto-flushed to make room), ``False`` if it was dropped.
+        """
+        entries_to_flush: Optional[list] = None
+        with self._lock:
+            if len(self._entries) >= self._max_size:
+                if self._on_flush:
+                    entries_to_flush = self._entries[:]
+                    self._total_flushed += len(entries_to_flush)
+                    self._entries = [self._record_to_dict(record)]
+                else:
+                    self._total_dropped += 1
+                    return False
+            else:
+                self._entries.append(self._record_to_dict(record))
+
+        if entries_to_flush is not None and self._on_flush:
+            self._on_flush(entries_to_flush)
+
+        return True
+
+    def flush(self) -> list[dict[str, Any]]:
+        """Flush and return all buffered entries.
+
+        Invokes the *on_flush* callback (if set) and clears the buffer.
+
+        Returns:
+            List of entry dictionaries.
+        """
+        with self._lock:
+            entries = self._entries[:]
+            self._total_flushed += len(entries)
+            self._entries = []
+
+        if entries and self._on_flush:
+            self._on_flush(entries)
+
+        return entries
+
+    def stop(self) -> list[dict[str, Any]]:
+        """Flush and stop the buffer.  Returns remaining entries."""
+        return self.flush()
+
+    def get_stats(self) -> dict[str, Any]:
+        """Return buffer statistics."""
+        with self._lock:
+            return {
+                "current_size": len(self._entries),
+                "max_size": self._max_size,
+                "total_flushed": self._total_flushed,
+                "total_dropped": self._total_dropped,
+            }
+
+    def _record_to_dict(self, record: logging.LogRecord) -> dict[str, Any]:
+        """Convert a log record to a serialisable dictionary."""
+        entry: dict[str, Any] = {
+            "timestamp": datetime.fromtimestamp(
+                record.created, tz=timezone.utc
+            ).isoformat(),
+            "level": record.levelname,
+            "message": record.getMessage(),
+            "logger": record.name,
+            "module": getattr(record, "module", ""),
+            "function": record.funcName,
+            "line": record.lineno,
+        }
+        cid = get_correlation_id()
+        if cid:
+            entry["correlation_id"] = cid
+        # Append extra fields
+        for key, value in record.__dict__.items():
+            if key not in _STANDARD_RECORD_DICT_ATTRS and not key.startswith("_"):
+                entry[key] = value
+        return entry
+
+
+class BufferedHandler(logging.Handler):
+    """Logging handler that routes records to a :class:`LogBuffer`.
+
+    Args:
+        buffer: The LogBuffer to write records into.
+    """
+
+    def __init__(self, buffer: LogBuffer) -> None:
+        super().__init__()
+        self._buffer = buffer
+
+    @property
+    def buffer(self) -> LogBuffer:
+        """The underlying :class:`LogBuffer`."""
+        return self._buffer
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """Add the record to the buffer."""
+        self._buffer.add(record)
+
+    def close(self) -> None:
+        """Flush the buffer and close the handler."""
+        self._buffer.stop()
+        super().close()
+
+
+# ---------------------------------------------------------------------------
+# Exception formatting helpers
+# ---------------------------------------------------------------------------
+
+
+def format_exception_context(
+    exc: BaseException,
+    include_chain: bool = True,
+    max_depth: int = 10,
+) -> dict[str, Any]:
+    """Format an exception as a rich context dictionary.
+
+    Includes the exception type, module, message, and traceback.  For
+    :class:`~src.errors.GatewayError` subclasses the structured error
+    context is also included.  Exception chains (``__cause__``) are
+    walked up to *max_depth* levels.
+
+    Args:
+        exc: The exception to describe.
+        include_chain: Whether to include the ``__cause__`` chain.
+        max_depth: Maximum chain depth to traverse.
+
+    Returns:
+        Dictionary with keys ``type``, ``module``, ``message``,
+        ``traceback``, and optionally ``chain``, ``is_retryable``,
+        ``error_context``.
+    """
+    import traceback as _traceback
+
+    result: dict[str, Any] = {
+        "type": type(exc).__name__,
+        "module": type(exc).__module__,
+        "message": str(exc),
+        "traceback": _traceback.format_tb(exc.__traceback__),
+    }
+
+    # Enrich GatewayError instances
+    try:
+        from src.errors import GatewayError
+
+        if isinstance(exc, GatewayError):
+            result["is_retryable"] = exc.is_retryable
+            result["error_context"] = exc.context.to_dict()
+    except ImportError:
+        pass
+
+    # Walk the exception chain
+    if include_chain:
+        chain: list[dict[str, Any]] = []
+        cause = exc.__cause__
+        depth = 0
+        while cause is not None and depth < max_depth:
+            chain.append(
+                {"type": type(cause).__name__, "message": str(cause)}
+            )
+            cause = cause.__cause__
+            depth += 1
+        if chain:
+            result["chain"] = chain
+
+    return result
+
+
+def log_exception(
+    logger: logging.Logger,
+    message: str,
+    exc: BaseException,
+    level: int = logging.ERROR,
+    **kwargs: Any,
+) -> None:
+    """Log an exception with structured context fields.
+
+    Attaches ``exception_type`` and ``exception_message`` to the log
+    record, plus any additional :class:`~src.errors.GatewayError` fields
+    (``is_retryable``, ``error_context``) when applicable.
+
+    Args:
+        logger: The logger to emit to.
+        message: Human-readable log message.
+        exc: The exception to log.
+        level: Log level (defaults to ERROR).
+        **kwargs: Additional fields to include in the record's ``extra``.
+    """
+    extra: dict[str, Any] = {
+        "exception_type": type(exc).__name__,
+        "exception_message": str(exc),
+    }
+    extra.update(kwargs)
+
+    try:
+        from src.errors import GatewayError
+
+        if isinstance(exc, GatewayError):
+            extra["is_retryable"] = exc.is_retryable
+            extra["error_context"] = exc.context.to_dict()
+    except ImportError:
+        pass
+
+    logger.log(level, message, exc_info=exc, extra=extra)
+
+
+# ---------------------------------------------------------------------------
+# HealthLogger
+# ---------------------------------------------------------------------------
+
+
+class HealthLogger:
+    """Periodically emits health-check log messages.
+
+    Runs a background timer that calls :meth:`emit_now` at each
+    *interval*.  Custom health-check functions can be registered to
+    include component-level status in each emission.
+
+    Args:
+        interval: Seconds between automatic health-check emissions.
+        include_metrics: Whether to include :class:`LogMetrics` data.
+    """
+
+    def __init__(
+        self,
+        interval: float = 60.0,
+        include_metrics: bool = False,
+    ) -> None:
+        self._interval = interval
+        self._include_metrics = include_metrics
+        self._logger = get_logger("health")
+        self._custom_checks: dict[str, Callable[[], Any]] = {}
+        self._running = False
+        self._heartbeat_count = 0
+        self._start_time: Optional[float] = None
+        self._timer: Optional[threading.Timer] = None
+        self._lock = threading.Lock()
+
+    def register_check(self, name: str, check_fn: Callable[[], Any]) -> None:
+        """Register a custom health-check function.
+
+        Args:
+            name: Unique identifier for the check.
+            check_fn: Zero-argument callable returning a status dict.
+        """
+        with self._lock:
+            self._custom_checks[name] = check_fn
+
+    def unregister_check(self, name: str) -> None:
+        """Remove a previously registered health check.
+
+        Args:
+            name: The check identifier to remove.
+        """
+        with self._lock:
+            self._custom_checks.pop(name, None)
+
+    def emit_now(self) -> dict[str, Any]:
+        """Execute all checks and emit a health log entry immediately.
+
+        Returns:
+            The health-status dictionary that was logged.
+        """
+        self._heartbeat_count += 1
+
+        uptime = (
+            time.monotonic() - self._start_time
+            if self._start_time is not None
+            else 0.0
+        )
+
+        data: dict[str, Any] = {
+            "status": "healthy",
+            "heartbeat_count": self._heartbeat_count,
+            "uptime_seconds": uptime,
+        }
+
+        # Run custom checks
+        with self._lock:
+            custom_checks = dict(self._custom_checks)
+
+        checks: dict[str, Any] = {}
+        all_ok = True
+        for name, check_fn in custom_checks.items():
+            try:
+                result = check_fn()
+                checks[name] = result
+            except Exception as e:
+                checks[name] = {"status": "error", "error": str(e)}
+                all_ok = False
+
+        if checks:
+            data["checks"] = checks
+
+        if not all_ok:
+            data["status"] = "degraded"
+
+        if self._include_metrics:
+            data["log_metrics"] = get_log_metrics().get_report()
+
+        self._logger.info("Health check", extra=data)
+        return data
+
+    def start(self) -> None:
+        """Start the background health-check timer."""
+        with self._lock:
+            if self._running:
+                return
+            self._running = True
+            if self._start_time is None:
+                self._start_time = time.monotonic()
+        self._schedule_next()
+
+    def stop(self) -> None:
+        """Stop the background health-check timer."""
+        with self._lock:
+            self._running = False
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+
+    def _schedule_next(self) -> None:
+        """Schedule the next health-check tick."""
+        with self._lock:
+            if not self._running:
+                return
+            self._timer = threading.Timer(self._interval, self._tick)
+            self._timer.daemon = True
+            self._timer.start()
+
+    def _tick(self) -> None:
+        """Background timer callback."""
+        if self._running:
+            self.emit_now()
+            self._schedule_next()
+
+
+# ---------------------------------------------------------------------------
+# setup_logging_advanced
+# ---------------------------------------------------------------------------
+
+
+def setup_logging_advanced(
+    level: str = "info",
+    log_format: str = "standard",
+    output: str = "console",
+    log_file: Optional[str] = None,
+    enable_metrics: bool = False,
+    enable_sensitive_filter: bool = False,
+    sampling_rates: Optional[dict[str, float]] = None,
+    enable_request_context: bool = False,
+    buffer_config: Optional[dict[str, Any]] = None,
+    **kwargs: Any,
+) -> logging.Logger:
+    """Configure logging with advanced features on top of the standard setup.
+
+    Calls :func:`setup_logging` first, then optionally attaches:
+
+    * :class:`LogMetricsHandler` for metrics collection
+    * :class:`SensitiveDataFilter` for secret redaction
+    * :class:`SamplingFilter` for probabilistic sampling
+    * :class:`RequestContextFilter` for request-context injection
+    * :class:`BufferedHandler` for in-memory buffering
+
+    Args:
+        level: Log level string.
+        log_format: Output format string.
+        output: Output destination (console/file/both).
+        log_file: Path to log file.
+        enable_metrics: Attach a :class:`LogMetricsHandler`.
+        enable_sensitive_filter: Attach a :class:`SensitiveDataFilter`.
+        sampling_rates: If given, attach a :class:`SamplingFilter`.
+        enable_request_context: Attach a :class:`RequestContextFilter`.
+        buffer_config: If given, create and attach a :class:`BufferedHandler`.
+            Recognised keys: ``max_size`` (int), ``on_flush`` (callable).
+        **kwargs: Extra keyword arguments forwarded to :func:`setup_logging`.
+
+    Returns:
+        The configured root gateway :class:`logging.Logger`.
+    """
+    global _managed_handlers
+
+    root_logger = setup_logging(
+        level=level,
+        log_format=log_format,
+        output=output,
+        log_file=log_file,
+        **kwargs,
+    )
+
+    root = logging.getLogger(ROOT_LOGGER_NAME)
+
+    # Metrics handler (attached as a handler, not a filter)
+    if enable_metrics:
+        metrics = get_log_metrics()
+        metrics_handler = LogMetricsHandler(metrics)
+        root.addHandler(metrics_handler)
+        _managed_handlers.append(metrics_handler)
+
+    # Per-handler filters
+    additional_filters: list[logging.Filter] = []
+    if enable_sensitive_filter:
+        additional_filters.append(SensitiveDataFilter())
+    if sampling_rates:
+        additional_filters.append(SamplingFilter(rates=sampling_rates))
+    if enable_request_context:
+        additional_filters.append(RequestContextFilter())
+
+    if additional_filters:
+        for handler in root.handlers:
+            for f in additional_filters:
+                handler.addFilter(f)
+
+    # Buffered handler
+    if buffer_config is not None:
+        buf = LogBuffer(
+            max_size=buffer_config.get("max_size", 1000),
+            on_flush=buffer_config.get("on_flush"),
+        )
+        buf_handler = BufferedHandler(buf)
+        root.addHandler(buf_handler)
+        _managed_handlers.append(buf_handler)
+
+    return root_logger

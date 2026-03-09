@@ -107,6 +107,14 @@ class AnthropicPassthroughHandler(http.server.BaseHTTPRequestHandler):
     # messages are routed to the configured provider instead of api.anthropic.com
     gateway_config: Optional[Any] = None  # GatewayConfig | None
 
+    # Response caching (None = disabled)
+    response_cache: Optional[Any] = None  # ResponseCache | None
+
+    # Cache statistics counters (class-level, reset per server subclass)
+    _cache_hits: int = 0
+    _cache_misses: int = 0
+    _cache_lock: threading.Lock = threading.Lock()
+
     def log_message(self, format: str, *args) -> None:
         """Route access logs through the logging module."""
         logger.info("anthropic-passthrough: %s", format % args)
@@ -116,7 +124,11 @@ class AnthropicPassthroughHandler(http.server.BaseHTTPRequestHandler):
     # ------------------------------------------------------------------ #
 
     def do_GET(self):
-        """Handle GET requests (e.g., /v1/models)."""
+        """Handle GET requests (e.g., /v1/models, /status)."""
+        path = self.path.split("?")[0]
+        if path == "/status":
+            self._serve_status()
+            return
         self._handle_request()
 
     def do_POST(self):

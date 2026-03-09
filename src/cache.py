@@ -209,6 +209,11 @@ class Cache:
         return self._default_ttl
 
     @property
+    def stale_ttl(self) -> float:
+        """Extra stale window in seconds (stale-while-revalidate)."""
+        return self._stale_ttl
+
+    @property
     def size(self) -> int:
         """Current number of entries (including expired ones not yet purged)."""
         with self._lock:
@@ -219,7 +224,10 @@ class Cache:
     def get(self, key: str, default: Any = None) -> Any:
         """Retrieve a value by key.
 
-        If the entry exists but has expired it is removed and treated as a miss.
+        If the entry exists but has expired it is removed and treated as a miss,
+        unless stale_ttl > 0 and the entry is still within the stale window — in
+        which case the stale value is returned and a background refresh may be
+        triggered.
 
         Args:
             key: Cache key.
@@ -234,20 +242,54 @@ class Cache:
                 self._stats.misses += 1
                 return default
 
-            if entry.is_expired:
-                del self._data[key]
-                self._stats.expirations += 1
-                self._stats.misses += 1
-                self._stats.current_size = len(self._data)
-                logger.debug("Cache '%s': expired key '%s'", self._name, key)
-                return default
+            if not entry.is_expired:
+                # Move to end (most recently used)
+                self._data.move_to_end(key)
+                entry.touch()
+                self._stats.hits += 1
+                logger.debug("Cache '%s': hit key '%s'", self._name, key)
+                return entry.value
 
-            # Move to end (most recently used)
-            self._data.move_to_end(key)
-            entry.touch()
-            self._stats.hits += 1
-            logger.debug("Cache '%s': hit key '%s'", self._name, key)
-            return entry.value
+            # Entry is expired — check stale-while-revalidate
+            if self._stale_ttl > 0:
+                stale_expires_at = entry.created_at + entry.ttl + self._stale_ttl
+                if time.time() <= stale_expires_at:
+                    # Serve stale value
+                    self._stats.hits += 1
+                    self._stats.stale_hits += 1
+                    logger.debug(
+                        "Cache '%s': stale hit key '%s'", self._name, key
+                    )
+                    # Trigger background refresh if callback set and not already refreshing
+                    if (
+                        self._refresh_callback is not None
+                        and key not in self._refreshing_keys
+                    ):
+                        self._refreshing_keys.add(key)
+                        import threading as _t
+
+                        cb = self._refresh_callback
+
+                        def _do_refresh(k: str = key) -> None:
+                            try:
+                                new_val = cb(k)
+                                self.set(k, new_val)
+                            except Exception:
+                                pass
+                            finally:
+                                with self._lock:
+                                    self._refreshing_keys.discard(k)
+
+                        _t.Thread(target=_do_refresh, daemon=True).start()
+                    return entry.value
+
+            # Truly expired
+            del self._data[key]
+            self._stats.expirations += 1
+            self._stats.misses += 1
+            self._stats.current_size = len(self._data)
+            logger.debug("Cache '%s': expired key '%s'", self._name, key)
+            return default
 
     def set(self, key: str, value: Any, ttl: Optional[float] = None) -> None:
         """Store a value.
@@ -339,13 +381,20 @@ class Cache:
     def purge_expired(self) -> int:
         """Remove all expired entries.
 
+        Entries within the stale-while-revalidate window (stale_ttl) are NOT
+        purged, as they can still be served as stale values.
+
         Returns:
             Number of expired entries removed.
         """
         with self._lock:
-            expired_keys = [
-                key for key, entry in self._data.items() if entry.is_expired
-            ]
+            now = time.time()
+            expired_keys = []
+            for key, entry in self._data.items():
+                if entry.is_expired:
+                    stale_expires = entry.created_at + entry.ttl + self._stale_ttl
+                    if now > stale_expires:
+                        expired_keys.append(key)
             for key in expired_keys:
                 del self._data[key]
                 self._stats.expirations += 1
@@ -373,6 +422,8 @@ class Cache:
                 sets=self._stats.sets,
                 current_size=self._stats.current_size,
                 max_size=self._stats.max_size,
+                stale_hits=self._stats.stale_hits,
+                compressed_entries=self._stats.compressed_entries,
             )
 
     def reset_stats(self) -> None:
@@ -806,3 +857,464 @@ def get_provider_cache() -> Cache:
         A Cache tuned for provider lookups (maxsize=64, ttl=600s).
     """
     return get_cache("providers", maxsize=64, ttl=600)
+
+
+# ---------------------------------------------------------------------------
+# Compression utilities
+# ---------------------------------------------------------------------------
+
+import gzip as _gzip
+import json as _json
+
+_COMPRESSION_THRESHOLD = 1024  # bytes — compress values larger than this
+
+
+def compress_value(value: Any) -> tuple[Any, bool]:
+    """Compress a value if it's large enough to benefit from compression.
+
+    Args:
+        value: The value to potentially compress.
+
+    Returns:
+        Tuple of (possibly_compressed_value, was_compressed).
+    """
+    try:
+        serialized = _json.dumps(value).encode("utf-8")
+    except (TypeError, ValueError):
+        return value, False
+
+    if len(serialized) < _COMPRESSION_THRESHOLD:
+        return value, False
+
+    import base64 as _base64
+
+    compressed = _gzip.compress(serialized)
+    return {
+        "__compressed__": True,
+        "data": _base64.b64encode(compressed).decode("ascii"),
+    }, True
+
+
+def decompress_value(value: Any) -> Any:
+    """Decompress a potentially compressed value.
+
+    Args:
+        value: The value to decompress.
+
+    Returns:
+        The decompressed value, or the original value if not compressed.
+    """
+    if not isinstance(value, dict) or "__compressed__" not in value:
+        return value
+
+    import base64 as _base64
+
+    compressed_data = _base64.b64decode(value["data"])
+    decompressed = _gzip.decompress(compressed_data)
+    return _json.loads(decompressed.decode("utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# Cache warmup
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class WarmupEntry:
+    """A single cache warmup entry.
+
+    Attributes:
+        key: The cache key.
+        loader: Callable that returns the value for this key.
+        ttl: Optional TTL override for this entry.
+    """
+
+    key: str
+    loader: Callable[[], Any]
+    ttl: Optional[float] = None
+
+
+class CacheWarmer:
+    """Pre-populates a cache with known values.
+
+    Args:
+        name: Optional name for this warmer.
+    """
+
+    def __init__(self, name: str = "default") -> None:
+        self._name = name
+        self._entries: list[WarmupEntry] = []
+        self._lock = threading.Lock()
+
+    def add(
+        self,
+        key: str,
+        loader: Callable[[], Any],
+        ttl: Optional[float] = None,
+    ) -> None:
+        """Add an entry to warm up.
+
+        Args:
+            key: Cache key.
+            loader: Callable that returns the value for this key.
+            ttl: Optional TTL override.
+        """
+        with self._lock:
+            self._entries.append(WarmupEntry(key=key, loader=loader, ttl=ttl))
+
+    def remove(self, key: str) -> bool:
+        """Remove an entry by key.
+
+        Args:
+            key: The key to remove.
+
+        Returns:
+            True if the entry was found and removed.
+        """
+        with self._lock:
+            for i, entry in enumerate(self._entries):
+                if entry.key == key:
+                    del self._entries[i]
+                    return True
+            return False
+
+    def clear(self) -> None:
+        """Remove all entries."""
+        with self._lock:
+            self._entries.clear()
+
+    @property
+    def entries(self) -> list:
+        """Return a copy of the entries list."""
+        with self._lock:
+            return list(self._entries)
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+    def __repr__(self) -> str:
+        return f"CacheWarmer(name={self._name!r}, entries={len(self)})"
+
+    def warmup(
+        self,
+        cache: Cache,
+        parallel: bool = False,
+        max_workers: int = 4,
+    ) -> dict[str, bool]:
+        """Populate the cache with all registered entries.
+
+        Args:
+            cache: The cache to warm.
+            parallel: Whether to load entries in parallel using a thread pool.
+            max_workers: Number of worker threads for parallel warmup.
+
+        Returns:
+            Dict mapping key -> True (success) or False (failed).
+        """
+        with self._lock:
+            entries = list(self._entries)
+
+        if not entries:
+            return {}
+
+        def _load_one(entry: WarmupEntry) -> tuple[str, bool]:
+            try:
+                value = entry.loader()
+                cache.set(entry.key, value, ttl=entry.ttl)
+                return entry.key, True
+            except Exception:
+                return entry.key, False
+
+        if parallel:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                results = list(executor.map(_load_one, entries))
+        else:
+            results = [_load_one(e) for e in entries]
+
+        return dict(results)
+
+
+# ---------------------------------------------------------------------------
+# Background purger
+# ---------------------------------------------------------------------------
+
+
+class BackgroundPurger:
+    """Periodically purges expired entries from registered caches.
+
+    Args:
+        interval: Seconds between purge cycles.
+        name: Optional name for this purger.
+    """
+
+    def __init__(self, interval: float = 60.0, name: str = "default") -> None:
+        self._interval = interval
+        self._name = name
+        self._caches: list[Cache] = []
+        self._lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+
+    @property
+    def interval(self) -> float:
+        """Purge interval in seconds."""
+        return self._interval
+
+    @property
+    def is_running(self) -> bool:
+        """Whether the background thread is running."""
+        with self._lock:
+            return self._thread is not None and self._thread.is_alive()
+
+    def add_cache(self, cache: Cache) -> None:
+        """Register a cache to be purged.
+
+        Args:
+            cache: The cache to register.
+        """
+        with self._lock:
+            if cache not in self._caches:
+                self._caches.append(cache)
+
+    def remove_cache(self, cache: Cache) -> bool:
+        """Unregister a cache.
+
+        Args:
+            cache: The cache to unregister.
+
+        Returns:
+            True if it was registered and has now been removed.
+        """
+        with self._lock:
+            if cache in self._caches:
+                self._caches.remove(cache)
+                return True
+            return False
+
+    def purge_now(self) -> dict[str, int]:
+        """Immediately purge all registered caches.
+
+        Returns:
+            Dict mapping cache name to number of expired entries removed.
+        """
+        with self._lock:
+            caches = list(self._caches)
+        results = {}
+        for cache in caches:
+            results[cache.name] = cache.purge_expired()
+        return results
+
+    def start(self) -> None:
+        """Start the background purge thread (no-op if already running)."""
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop_event.clear()
+            self._thread = threading.Thread(
+                target=self._run,
+                daemon=True,
+                name=f"cache-purger-{self._name}",
+            )
+            self._thread.start()
+
+    def stop(self) -> None:
+        """Stop the background purge thread (no-op if not running)."""
+        self._stop_event.set()
+        with self._lock:
+            thread = self._thread
+        if thread is not None:
+            thread.join(timeout=self._interval + 1)
+            with self._lock:
+                self._thread = None
+
+    def _run(self) -> None:
+        """Background thread main loop."""
+        while not self._stop_event.wait(timeout=self._interval):
+            self.purge_now()
+
+    def __repr__(self) -> str:
+        return (
+            f"BackgroundPurger(name={self._name!r}, "
+            f"interval={self._interval}, running={self.is_running})"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tiered cache (L1 in-memory + L2 file-based)
+# ---------------------------------------------------------------------------
+
+
+class TieredCache:
+    """Two-tier cache: fast in-memory L1 + persistent file-based L2.
+
+    On a miss in L1, the value is fetched from L2 and promoted to L1.
+
+    Args:
+        l1_maxsize: Maximum entries for the L1 (in-memory) cache.
+        l1_ttl: TTL in seconds for the L1 cache.
+        l2_directory: Directory for the L2 (file) cache.
+        l2_ttl: TTL in seconds for the L2 cache.
+        name: Optional name for this tiered cache.
+        enable_compression: Whether to compress large values in L2.
+    """
+
+    def __init__(
+        self,
+        l1_maxsize: int = 256,
+        l1_ttl: float = 0.0,
+        l2_directory: Optional[Path] = None,
+        l2_ttl: float = 0.0,
+        name: str = "tiered",
+        enable_compression: bool = False,
+    ) -> None:
+        self._name = name
+        self._enable_compression = enable_compression
+        self.l1 = Cache(maxsize=l1_maxsize, ttl=l1_ttl, name=f"{name}.l1")
+        if l2_directory is None:
+            import tempfile
+
+            l2_directory = Path(tempfile.mkdtemp())
+        self.l2 = FileCache(
+            directory=l2_directory, ttl=l2_ttl, name=f"{name}.l2"
+        )
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """Get a value, checking L1 then L2 (and promoting on L2 hit).
+
+        Args:
+            key: Cache key.
+            default: Value returned if key is absent in both tiers.
+
+        Returns:
+            The cached value or *default*.
+        """
+        value = self.l1.get(key)
+        if value is not None:
+            return value
+
+        # Try L2
+        value = self.l2.get(key)
+        if value is not None:
+            # Decompress if needed
+            if self._enable_compression:
+                value = decompress_value(value)
+            # Promote to L1
+            self.l1.set(key, value)
+            return value
+
+        return default
+
+    def set(self, key: str, value: Any, ttl: Optional[float] = None) -> None:
+        """Store a value in both tiers.
+
+        Args:
+            key: Cache key.
+            value: Value to store.
+            ttl: Optional per-entry TTL override.
+        """
+        self.l1.set(key, value, ttl=ttl)
+        # Compress for L2 if enabled
+        l2_value = value
+        if self._enable_compression:
+            compressed_val, was_compressed = compress_value(value)
+            if was_compressed:
+                l2_value = compressed_val
+        self.l2.set(key, l2_value, ttl=ttl)
+
+    def delete(self, key: str) -> bool:
+        """Remove a key from both tiers.
+
+        Args:
+            key: Cache key to remove.
+
+        Returns:
+            True if the key was present in at least one tier.
+        """
+        r1 = self.l1.delete(key)
+        r2 = self.l2.delete(key)
+        return r1 or r2
+
+    def has(self, key: str) -> bool:
+        """Check if key exists in either tier.
+
+        Args:
+            key: Cache key to check.
+
+        Returns:
+            True if the key is present (and not expired) in either tier.
+        """
+        return self.l1.has(key) or self.l2.has(key)
+
+    def clear(self) -> int:
+        """Clear both tiers.
+
+        Returns:
+            Total number of entries removed across both tiers.
+        """
+        return self.l1.clear() + self.l2.clear()
+
+    def get_stats(self) -> dict[str, Any]:
+        """Return stats for both tiers.
+
+        Returns:
+            Dict with 'name', 'l1', and 'l2' keys.
+        """
+        return {
+            "name": self._name,
+            "l1": self.l1.get_stats().to_dict(),
+            "l2": self.l2.get_stats().to_dict(),
+        }
+
+    def __contains__(self, key: str) -> bool:
+        return self.has(key)
+
+    def __repr__(self) -> str:
+        return f"TieredCache(name={self._name!r}, l1_size={self.l1.size})"
+
+
+# ---------------------------------------------------------------------------
+# Global background purger
+# ---------------------------------------------------------------------------
+
+_global_purger: Optional[BackgroundPurger] = None
+_global_purger_lock = threading.Lock()
+
+
+def get_background_purger(interval: float = 60.0) -> BackgroundPurger:
+    """Get or create the global background purger.
+
+    Args:
+        interval: Purge interval in seconds (only used on first call).
+
+    Returns:
+        The global BackgroundPurger instance.
+    """
+    global _global_purger
+    with _global_purger_lock:
+        if _global_purger is None:
+            _global_purger = BackgroundPurger(interval=interval, name="global")
+        return _global_purger
+
+
+def stop_background_purger() -> None:
+    """Stop the global background purger if running."""
+    global _global_purger
+    with _global_purger_lock:
+        purger = _global_purger
+        _global_purger = None
+    if purger is not None:
+        purger.stop()
+
+
+def get_response_cache() -> Any:
+    """Get the global response cache.
+
+    Returns:
+        The global ResponseCache instance.
+    """
+    from src.response_cache import get_response_cache as _get_rc
+
+    return _get_rc()

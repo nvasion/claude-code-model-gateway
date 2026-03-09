@@ -1941,6 +1941,159 @@ def cache_purge():
         click.echo(f"\nPurged {total} expired entries total.")
 
 
+@cache.command("info")
+@click.option(
+    "--format",
+    "fmt",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    show_default=True,
+    help="Output format.",
+)
+def cache_info(fmt: str):
+    """Show detailed cache information for all active caches.
+
+    Displays current size, capacity, TTL settings, hit/miss rates,
+    and stale-while-revalidate configuration for each registered cache.
+
+    Example:
+
+        claude-code-model-gateway cache info
+
+        claude-code-model-gateway cache info --format json
+    """
+    import json as json_mod
+
+    from src.cache import list_caches
+
+    caches = list_caches()
+
+    if fmt == "json":
+        result: dict = {"caches": {}}
+        for name, c in sorted(caches.items()):
+            stats = c.get_stats()
+            result["caches"][name] = {
+                "current_size": stats.current_size,
+                "max_size": stats.max_size,
+                "hits": stats.hits,
+                "misses": stats.misses,
+                "evictions": stats.evictions,
+                "sets": stats.sets,
+                "hit_rate": round(stats.hit_rate, 2),
+                "ttl": c.default_ttl,
+                "stale_ttl": c.stale_ttl,
+            }
+        click.echo(json_mod.dumps(result, indent=2))
+        return
+
+    if not caches:
+        click.echo("No active caches")
+        return
+
+    for name, c in sorted(caches.items()):
+        stats = c.get_stats()
+        click.echo(f"Cache: {name}")
+        click.echo(f"  Max size:    {stats.max_size}")
+        click.echo(f"  Current:     {stats.current_size}")
+        click.echo(f"  Default TTL: {c.default_ttl:.1f}s")
+        click.echo(f"  Stale TTL:   {c.stale_ttl:.1f}s")
+        click.echo(f"  Hits:        {stats.hits}")
+        click.echo(f"  Misses:      {stats.misses}")
+        click.echo(f"  Hit rate:    {stats.hit_rate:.1f}%")
+        click.echo()
+
+
+@cache.command("warmup")
+@click.option(
+    "--providers/--no-providers",
+    default=True,
+    help="Warm the provider-config cache.",
+)
+def cache_warmup(providers: bool):
+    """Pre-populate caches to improve initial request performance.
+
+    Loads configuration and other commonly-needed data into the relevant
+    caches so that early requests experience lower latency.
+
+    Example:
+
+        claude-code-model-gateway cache warmup
+
+        claude-code-model-gateway cache warmup --no-providers
+    """
+    if not providers:
+        click.echo("Nothing to warm up.")
+        return
+
+    click.echo("Warming caches...")
+    try:
+        from src.config import load_config
+
+        load_config(use_cache=True)
+        click.echo("  Provider config cache: warmed")
+    except Exception as e:
+        click.echo(f"  Provider config cache: skipped ({e})")
+
+    click.echo("Warmup complete.")
+
+
+@cache.command("response-stats")
+@click.option(
+    "--format",
+    "fmt",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    show_default=True,
+    help="Output format.",
+)
+def cache_response_stats(fmt: str):
+    """Show response cache statistics.
+
+    Displays lookup counts, hit/miss rates, bytes saved, and compression
+    metrics for the global HTTP response cache.
+
+    Example:
+
+        claude-code-model-gateway cache response-stats
+
+        claude-code-model-gateway cache response-stats --format json
+    """
+    import json as json_mod
+
+    try:
+        from src.response_cache import get_response_cache
+
+        rc = get_response_cache()
+        stats = rc.get_stats()
+        stats_dict = stats.to_dict()
+    except Exception:
+        stats_dict = {
+            "lookups": 0,
+            "hits": 0,
+            "misses": 0,
+            "stores": 0,
+            "evictions": 0,
+            "bypasses": 0,
+            "hit_rate": 0.0,
+            "bytes_saved": 0,
+            "compressed_stores": 0,
+        }
+
+    if fmt == "json":
+        click.echo(json_mod.dumps(stats_dict, indent=2))
+        return
+
+    click.echo("Response Cache Statistics")
+    click.echo("=" * 40)
+    click.echo(f"  Lookups:     {stats_dict['lookups']}")
+    click.echo(f"  Hits:        {stats_dict['hits']}")
+    click.echo(f"  Misses:      {stats_dict['misses']}")
+    click.echo(f"  Stores:      {stats_dict['stores']}")
+    click.echo(f"  Bypasses:    {stats_dict['bypasses']}")
+    click.echo(f"  Hit rate:    {stats_dict['hit_rate']:.1f}%")
+    click.echo(f"  Bytes saved: {stats_dict['bytes_saved']}")
+
+
 # ---------------------------------------------------------------------------
 # Logging management commands
 # ---------------------------------------------------------------------------
@@ -2155,6 +2308,160 @@ def logging_levels():
     click.echo()
     click.echo("Set via: config set log_level <level>")
     click.echo("Override: --verbose flag sets level to debug")
+
+
+@logging_group.command("metrics")
+@click.option(
+    "--format",
+    "fmt",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    help="Output format.",
+)
+def logging_metrics(fmt: str):
+    """Show log metrics collected since startup.
+
+    Displays message counts by level and module, recent errors, and
+    error rate.
+
+    Example:
+
+        claude-code-model-gateway logging metrics
+
+        claude-code-model-gateway logging metrics --format json
+    """
+    import json as json_mod
+
+    from src.logging_config import get_log_metrics
+
+    metrics = get_log_metrics()
+    report = metrics.get_report()
+
+    if fmt == "json":
+        click.echo(json_mod.dumps(report, indent=2, default=str))
+    else:
+        click.echo("Log Metrics Report")
+        click.echo("=" * 50)
+        click.echo(f"  Total messages : {report['total_count']}")
+        click.echo()
+        click.echo("  By level:")
+        for level_name, count in sorted(report.get("levels", {}).items()):
+            click.echo(f"    {level_name:<10} {count}")
+        click.echo()
+        click.echo("  Top modules:")
+        top = sorted(
+            report.get("top_modules", {}).items(),
+            key=lambda kv: kv[1],
+            reverse=True,
+        )[:10]
+        for mod, count in top:
+            click.echo(f"    {mod:<40} {count}")
+        click.echo()
+        recent = report.get("recent_errors", [])
+        if recent:
+            click.echo(f"  Recent errors ({len(recent)}):")
+            for err in recent[-5:]:
+                click.echo(f"    [{err.get('module', '')}] {err.get('message', '')}")
+
+
+@logging_group.command("health")
+@click.option(
+    "--format",
+    "fmt",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    help="Output format.",
+)
+def logging_health(fmt: str):
+    """Show logging system health status.
+
+    Reports overall status, uptime, and message counts.
+
+    Example:
+
+        claude-code-model-gateway logging health
+
+        claude-code-model-gateway logging health --format json
+    """
+    import json as json_mod
+    import time as _time
+
+    from src.logging_config import get_log_metrics, is_configured
+
+    metrics = get_log_metrics()
+    report = metrics.get_report()
+    error_rate = metrics.get_error_rate()
+
+    data = {
+        "status": "healthy",
+        "configured": is_configured(),
+        "total_messages": report["total_count"],
+        "uptime_seconds": report.get("uptime_seconds", 0.0),
+        "error_rate_per_minute": error_rate,
+        "levels": report.get("levels", {}),
+    }
+
+    if fmt == "json":
+        click.echo(json_mod.dumps(data, indent=2, default=str))
+    else:
+        click.echo("Logging System Health")
+        click.echo("=" * 50)
+        click.echo(f"  Status          : {data['status']}")
+        click.echo(f"  Configured      : {data['configured']}")
+        click.echo(f"  Total messages  : {data['total_messages']}")
+        click.echo(
+            f"  Uptime          : {data['uptime_seconds']:.1f}s"
+        )
+        click.echo(
+            f"  Error rate      : {data['error_rate_per_minute']:.2f}/min"
+        )
+
+
+@logging_group.command("test-redaction")
+def logging_test_redaction():
+    """Test sensitive data redaction in log output.
+
+    Emits sample log messages containing mock secrets and shows that
+    they are properly redacted by the SensitiveDataFilter.
+
+    Example:
+
+        claude-code-model-gateway logging test-redaction
+    """
+    from src.logging_config import SensitiveDataFilter, setup_logging
+
+    setup_logging(level="debug", output="console")
+    logger = get_logger("redaction-test")
+
+    f = SensitiveDataFilter()
+
+    test_cases = [
+        "Config api_key = sk-ant-abcdef1234567890abcdef",
+        "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig",
+        "password = hunter2_super_secret",
+        "Normal log message with no sensitive data",
+    ]
+
+    click.echo("Testing sensitive data redaction:")
+    click.echo("-" * 40)
+    for msg in test_cases:
+        import logging as _logging
+
+        record = _logging.LogRecord(
+            name="test",
+            level=_logging.INFO,
+            pathname="",
+            lineno=0,
+            msg=msg,
+            args=(),
+            exc_info=None,
+        )
+        f.filter(record)
+        click.echo(f"  Original : {msg[:60]}")
+        click.echo(f"  Redacted : {record.msg[:60]}")
+        click.echo()
+
+    click.echo("Redaction test complete")
 
 
 if __name__ == "__main__":
