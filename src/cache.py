@@ -68,6 +68,8 @@ class CacheStats:
     sets: int = 0
     current_size: int = 0
     max_size: int = 0
+    stale_hits: int = 0
+    compressed_entries: int = 0
 
     @property
     def total_requests(self) -> int:
@@ -93,6 +95,8 @@ class CacheStats:
             "max_size": self.max_size,
             "total_requests": self.total_requests,
             "hit_rate": round(self.hit_rate, 2),
+            "stale_hits": self.stale_hits,
+            "compressed_entries": self.compressed_entries,
         }
 
 
@@ -161,6 +165,12 @@ class Cache:
         maxsize: Maximum number of entries. 0 means unlimited.
         ttl: Default time-to-live in seconds. 0 means no expiration.
         name: Human-readable name for this cache (used in logging/stats).
+        stale_ttl: Extra seconds after TTL expiry during which an expired
+            entry may still be served as stale (stale-while-revalidate).
+            0 means disabled.
+        refresh_callback: Optional callable ``(key) -> value`` invoked in a
+            background thread when a stale hit is served, so the cache can
+            be refreshed asynchronously.
     """
 
     def __init__(
@@ -168,13 +178,18 @@ class Cache:
         maxsize: int = 256,
         ttl: float = 0.0,
         name: str = "default",
+        stale_ttl: float = 0.0,
+        refresh_callback: Optional[Callable[[str], Any]] = None,
     ) -> None:
         self._maxsize = maxsize
         self._default_ttl = ttl
         self._name = name
+        self._stale_ttl = stale_ttl
+        self._refresh_callback = refresh_callback
         self._data: OrderedDict[str, CacheEntry] = OrderedDict()
         self._lock = threading.Lock()
         self._stats = CacheStats(max_size=maxsize)
+        self._refreshing_keys: set = set()
 
     # -- Properties ----------------------------------------------------------
 
