@@ -19,11 +19,13 @@ from typing import Optional
 
 from src.errors import (
     BadGatewayError,
+    GatewayError,
     GatewayTimeoutError,
     NetworkError,
     SSLError as GatewaySSLError,
     TimeoutError_,
 )
+from src.error_handling import get_error_tracker
 from src.logging_config import get_logger, log_request
 from src.retry import BackoffStrategy, RetryConfig, retry_call
 
@@ -271,6 +273,16 @@ class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
                 "Proxy error for %s %s: %s (%.1fms)",
                 self.command, self.path, exc, duration_ms,
             )
+            # Record error in global tracker
+            try:
+                tracker = get_error_tracker()
+                tracker.record_error(
+                    host or "unknown",
+                    exc,
+                    latency_ms=duration_ms,
+                )
+            except Exception:
+                pass
             self._send_error(502, f"Bad Gateway: {exc}")
 
     def _send_error(self, code: int, message: str) -> None:

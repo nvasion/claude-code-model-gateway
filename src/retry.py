@@ -461,10 +461,10 @@ class _Attempt:
 
         unlimited = self._ctx.config.max_attempts == 0
         if not unlimited and self.number >= self._ctx.config.max_attempts:
-            return False  # Last attempt — propagate
+            return True  # Last attempt — suppress so __iter__ raises RetryExhaustedError
 
         if self._ctx.config.total_timeout and elapsed >= self._ctx.config.total_timeout:
-            return False
+            return True  # Timeout — suppress so __iter__ raises RetryExhaustedError
 
         # Compute delay
         delay = self._ctx.config.compute_delay(self.number)
@@ -794,3 +794,307 @@ def clear_breaker_registry() -> None:
     """Remove all circuit breakers from the global registry."""
     with _breaker_lock:
         _breaker_registry.clear()
+
+
+# --------------------------------------------------------------------------- #
+# Adaptive retry configuration
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class AdaptiveRetryConfig:
+    """Retry configuration that adapts based on observed error patterns.
+
+    Adjusts retry behaviour dynamically:
+    - Increases delay when rate-limited (respects Retry-After).
+    - Reduces max attempts when a provider is consistently failing.
+    - Switches to linear backoff under sustained load.
+    - Resets to defaults when the provider recovers.
+
+    The adapter wraps a base :class:`RetryConfig` and produces a
+    new config for each request based on current conditions.
+
+    Attributes:
+        base_config: The starting retry configuration.
+        min_attempts: Minimum number of attempts (never go below this).
+        max_attempts_ceiling: Absolute maximum attempts.
+        rate_limit_multiplier: Multiply base delay by this when rate-limited.
+        error_rate_threshold: Error rate (per second) above which to
+            reduce max attempts.
+        success_rate_threshold: Success rate below which to reduce retries.
+        recovery_success_count: Consecutive successes needed to restore
+            original config.
+    """
+
+    base_config: RetryConfig = field(default_factory=RetryConfig)
+    min_attempts: int = 1
+    max_attempts_ceiling: int = 10
+    rate_limit_multiplier: float = 2.0
+    error_rate_threshold: float = 0.5
+    success_rate_threshold: float = 0.7
+    recovery_success_count: int = 5
+
+    def __post_init__(self) -> None:
+        """Initialize mutable state."""
+        self._lock = threading.Lock()
+        self._consecutive_successes: int = 0
+        self._consecutive_rate_limits: int = 0
+        self._current_delay_multiplier: float = 1.0
+        self._current_max_attempts: int = self.base_config.max_attempts
+        self._current_strategy: BackoffStrategy = self.base_config.backoff_strategy
+
+    def get_config(
+        self,
+        error_rate: float = 0.0,
+        success_rate: float = 1.0,
+    ) -> RetryConfig:
+        """Produce a RetryConfig adapted to current conditions.
+
+        Args:
+            error_rate: Current errors per second for the provider.
+            success_rate: Current success rate (0.0–1.0) for the provider.
+
+        Returns:
+            An adapted RetryConfig.
+        """
+        with self._lock:
+            max_attempts = self._current_max_attempts
+            base_delay = self.base_config.base_delay * self._current_delay_multiplier
+            strategy = self._current_strategy
+
+            # Reduce attempts if error rate is high
+            if error_rate > self.error_rate_threshold:
+                max_attempts = max(self.min_attempts, max_attempts - 1)
+
+            # Reduce attempts if success rate is low
+            if success_rate < self.success_rate_threshold:
+                max_attempts = max(self.min_attempts, max_attempts - 1)
+
+            # Switch to linear backoff under sustained errors
+            if error_rate > self.error_rate_threshold * 2:
+                strategy = BackoffStrategy.LINEAR
+
+            return RetryConfig(
+                max_attempts=max_attempts,
+                backoff_strategy=strategy,
+                base_delay=min(base_delay, self.base_config.max_delay),
+                max_delay=self.base_config.max_delay,
+                exponential_base=self.base_config.exponential_base,
+                jitter=self.base_config.jitter,
+                jitter_range=self.base_config.jitter_range,
+                retry_on=self.base_config.retry_on,
+                retry_on_status=self.base_config.retry_on_status,
+                total_timeout=self.base_config.total_timeout,
+                on_retry=self.base_config.on_retry,
+            )
+
+    def record_rate_limit(self) -> None:
+        """Record a rate-limit event, increasing delay for future retries."""
+        with self._lock:
+            self._consecutive_rate_limits += 1
+            self._consecutive_successes = 0
+            # Increase delay multiplier (caps at 8x)
+            self._current_delay_multiplier = min(
+                8.0,
+                self._current_delay_multiplier * self.rate_limit_multiplier,
+            )
+            logger.debug(
+                "Adaptive retry: rate limit recorded, delay multiplier=%.1f",
+                self._current_delay_multiplier,
+            )
+
+    def record_overload(self) -> None:
+        """Record an overloaded/unavailable event, reducing aggressiveness."""
+        with self._lock:
+            self._consecutive_successes = 0
+            # Reduce max attempts
+            self._current_max_attempts = max(
+                self.min_attempts,
+                self._current_max_attempts - 1,
+            )
+            # Increase delay
+            self._current_delay_multiplier = min(
+                8.0,
+                self._current_delay_multiplier * 1.5,
+            )
+            logger.debug(
+                "Adaptive retry: overload recorded, max_attempts=%d, delay_mult=%.1f",
+                self._current_max_attempts,
+                self._current_delay_multiplier,
+            )
+
+    def record_success(self) -> None:
+        """Record a success, potentially restoring original config."""
+        with self._lock:
+            self._consecutive_successes += 1
+            self._consecutive_rate_limits = 0
+
+            if self._consecutive_successes >= self.recovery_success_count:
+                # Gradually restore to defaults
+                self._current_delay_multiplier = max(
+                    1.0, self._current_delay_multiplier * 0.5
+                )
+                self._current_max_attempts = min(
+                    self.base_config.max_attempts,
+                    self._current_max_attempts + 1,
+                )
+                self._current_strategy = self.base_config.backoff_strategy
+
+                # Full reset if we're back to normal
+                if (
+                    self._current_delay_multiplier <= 1.0
+                    and self._current_max_attempts >= self.base_config.max_attempts
+                ):
+                    self._current_delay_multiplier = 1.0
+                    self._consecutive_successes = 0
+                    logger.debug("Adaptive retry: fully recovered to defaults")
+
+    def record_error(self, error: Exception) -> None:
+        """Record an error and adapt retry behaviour accordingly.
+
+        Dispatches to the appropriate handler based on error type.
+
+        Args:
+            error: The exception that occurred.
+        """
+        from src.errors import RateLimitError, OverloadedError, ProviderUnavailableError
+
+        if isinstance(error, RateLimitError):
+            self.record_rate_limit()
+        elif isinstance(error, (OverloadedError, ProviderUnavailableError)):
+            self.record_overload()
+        else:
+            # Generic error: reset success counter
+            with self._lock:
+                self._consecutive_successes = 0
+
+    def reset(self) -> None:
+        """Reset adaptive state to defaults."""
+        with self._lock:
+            self._consecutive_successes = 0
+            self._consecutive_rate_limits = 0
+            self._current_delay_multiplier = 1.0
+            self._current_max_attempts = self.base_config.max_attempts
+            self._current_strategy = self.base_config.backoff_strategy
+
+    def get_state(self) -> dict[str, Any]:
+        """Return the current adaptive state for inspection.
+
+        Returns:
+            Dictionary with current adaptive parameters.
+        """
+        with self._lock:
+            return {
+                "current_max_attempts": self._current_max_attempts,
+                "current_delay_multiplier": self._current_delay_multiplier,
+                "current_strategy": self._current_strategy.value,
+                "consecutive_successes": self._consecutive_successes,
+                "consecutive_rate_limits": self._consecutive_rate_limits,
+                "base_max_attempts": self.base_config.max_attempts,
+                "base_delay": self.base_config.base_delay,
+            }
+
+
+# --------------------------------------------------------------------------- #
+# Per-provider retry policies
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class RetryPolicy:
+    """Named retry policy for a specific provider or use case.
+
+    Combines a :class:`RetryConfig` with a descriptive name and optional
+    adaptive behaviour.
+
+    Attributes:
+        name: Policy identifier (e.g. ``"anthropic-messages"``).
+        retry_config: The static retry configuration.
+        adaptive: Optional adaptive config that modulates the static config.
+        circuit_breaker_config: Optional circuit breaker for this policy.
+    """
+
+    name: str
+    retry_config: RetryConfig = field(default_factory=RetryConfig)
+    adaptive: Optional[AdaptiveRetryConfig] = None
+    circuit_breaker_config: Optional[CircuitBreakerConfig] = None
+
+    def get_effective_config(
+        self,
+        error_rate: float = 0.0,
+        success_rate: float = 1.0,
+    ) -> RetryConfig:
+        """Get the effective retry config, applying adaptive adjustments.
+
+        Args:
+            error_rate: Current errors per second.
+            success_rate: Current success rate (0.0–1.0).
+
+        Returns:
+            The effective RetryConfig.
+        """
+        if self.adaptive:
+            return self.adaptive.get_config(
+                error_rate=error_rate,
+                success_rate=success_rate,
+            )
+        return self.retry_config
+
+    def record_outcome(self, error: Optional[Exception] = None) -> None:
+        """Record the outcome of a request for adaptive tuning.
+
+        Args:
+            error: The exception if the request failed, None for success.
+        """
+        if self.adaptive:
+            if error is None:
+                self.adaptive.record_success()
+            else:
+                self.adaptive.record_error(error)
+
+
+# --------------------------------------------------------------------------- #
+# Retry policy registry
+# --------------------------------------------------------------------------- #
+
+_policy_registry: dict[str, RetryPolicy] = {}
+_policy_lock = threading.Lock()
+
+
+def register_retry_policy(policy: RetryPolicy) -> None:
+    """Register a named retry policy in the global registry.
+
+    Args:
+        policy: The retry policy to register.
+    """
+    with _policy_lock:
+        _policy_registry[policy.name] = policy
+
+
+def get_retry_policy(name: str) -> Optional[RetryPolicy]:
+    """Look up a named retry policy.
+
+    Args:
+        name: Policy name.
+
+    Returns:
+        The retry policy, or None if not registered.
+    """
+    with _policy_lock:
+        return _policy_registry.get(name)
+
+
+def list_retry_policies() -> dict[str, RetryPolicy]:
+    """Return all registered retry policies.
+
+    Returns:
+        Dictionary mapping policy names to RetryPolicy instances.
+    """
+    with _policy_lock:
+        return dict(_policy_registry)
+
+
+def clear_retry_policies() -> None:
+    """Remove all registered retry policies."""
+    with _policy_lock:
+        _policy_registry.clear()

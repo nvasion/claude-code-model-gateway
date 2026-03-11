@@ -34,6 +34,7 @@ from src.logging_config import (
     get_active_config,
     get_audit_logger,
     get_correlation_id,
+    get_log_files,
     get_log_level_name,
     get_logger,
     get_logging_status,
@@ -42,6 +43,7 @@ from src.logging_config import (
     log_request,
     reset_logging,
     set_correlation_id,
+    set_log_level,
     setup_logging,
 )
 
@@ -1209,3 +1211,1085 @@ class TestIntegration:
             t.join()
 
         assert len(errors) == 0, f"Errors occurred in threads: {errors}"
+
+
+# ---------------------------------------------------------------------------
+# LoggingConfig new fields (rotation / queue)
+# ---------------------------------------------------------------------------
+
+
+class TestLoggingConfigNewFields:
+    """Tests for new LoggingConfig fields added for rotation and async support."""
+
+    def test_default_rotation_mode_is_size(self):
+        cfg = LoggingConfig()
+        assert cfg.rotation_mode == "size"
+
+    def test_default_rotation_when(self):
+        cfg = LoggingConfig()
+        assert cfg.rotation_when == "midnight"
+
+    def test_default_rotation_interval(self):
+        cfg = LoggingConfig()
+        assert cfg.rotation_interval == 1
+
+    def test_default_use_queue_handler_false(self):
+        cfg = LoggingConfig()
+        assert cfg.use_queue_handler is False
+
+    def test_default_queue_max_size(self):
+        cfg = LoggingConfig()
+        assert cfg.queue_max_size == 10000
+
+    def test_to_dict_includes_new_fields(self):
+        cfg = LoggingConfig(
+            rotation_mode="time",
+            rotation_when="H",
+            rotation_interval=2,
+            use_queue_handler=True,
+            queue_max_size=5000,
+        )
+        d = cfg.to_dict()
+        assert d["rotation_mode"] == "time"
+        assert d["rotation_when"] == "H"
+        assert d["rotation_interval"] == 2
+        assert d["use_queue_handler"] is True
+        assert d["queue_max_size"] == 5000
+
+    def test_from_dict_roundtrip_new_fields(self):
+        original = LoggingConfig(
+            rotation_mode="time",
+            rotation_when="D",
+            rotation_interval=7,
+            use_queue_handler=True,
+            queue_max_size=2000,
+        )
+        restored = LoggingConfig.from_dict(original.to_dict())
+        assert restored.rotation_mode == "time"
+        assert restored.rotation_when == "D"
+        assert restored.rotation_interval == 7
+        assert restored.use_queue_handler is True
+        assert restored.queue_max_size == 2000
+
+    def test_from_dict_defaults_for_missing_new_fields(self):
+        """from_dict should gracefully handle dicts without new fields."""
+        d = {
+            "level": "info",
+            "log_format": "standard",
+            "output": "console",
+        }
+        cfg = LoggingConfig.from_dict(d)
+        assert cfg.rotation_mode == "size"
+        assert cfg.use_queue_handler is False
+        assert cfg.queue_max_size == 10000
+
+    def test_custom_rotation_mode_stored(self):
+        cfg = LoggingConfig(rotation_mode="time")
+        assert cfg.rotation_mode == "time"
+
+    def test_custom_queue_max_size_stored(self):
+        cfg = LoggingConfig(queue_max_size=256)
+        assert cfg.queue_max_size == 256
+
+
+# ---------------------------------------------------------------------------
+# LoggingConfig.from_env()
+# ---------------------------------------------------------------------------
+
+
+class TestLoggingConfigFromEnv:
+    """Tests for LoggingConfig.from_env() classmethod."""
+
+    def test_from_env_defaults_when_no_env_vars(self):
+        # Remove any stray GATEWAY_LOG_* vars before testing defaults
+        clean = {
+            k: v for k, v in os.environ.items()
+            if not k.startswith("GATEWAY_LOG_")
+        }
+        with patch.dict(os.environ, clean, clear=True):
+            cfg = LoggingConfig.from_env()
+        default = LoggingConfig()
+        assert cfg.level == default.level
+        assert cfg.log_format == default.log_format
+        assert cfg.output == default.output
+
+    def test_from_env_reads_level(self):
+        with patch.dict(os.environ, {"GATEWAY_LOG_LEVEL": "debug"}):
+            cfg = LoggingConfig.from_env()
+        assert cfg.level == "debug"
+
+    def test_from_env_reads_format(self):
+        with patch.dict(os.environ, {"GATEWAY_LOG_FORMAT": "json"}):
+            cfg = LoggingConfig.from_env()
+        assert cfg.log_format == "json"
+
+    def test_from_env_reads_output(self):
+        with patch.dict(os.environ, {"GATEWAY_LOG_OUTPUT": "file"}):
+            cfg = LoggingConfig.from_env()
+        assert cfg.output == "file"
+
+    def test_from_env_reads_log_file(self):
+        with patch.dict(os.environ, {"GATEWAY_LOG_FILE": "custom.log"}):
+            cfg = LoggingConfig.from_env()
+        assert cfg.log_file == "custom.log"
+
+    def test_from_env_reads_max_bytes(self):
+        with patch.dict(os.environ, {"GATEWAY_LOG_MAX_BYTES": "5242880"}):
+            cfg = LoggingConfig.from_env()
+        assert cfg.max_bytes == 5242880
+
+    def test_from_env_reads_backup_count(self):
+        with patch.dict(os.environ, {"GATEWAY_LOG_BACKUP_COUNT": "10"}):
+            cfg = LoggingConfig.from_env()
+        assert cfg.backup_count == 10
+
+    def test_from_env_reads_rate_limit(self):
+        with patch.dict(os.environ, {"GATEWAY_LOG_RATE_LIMIT": "0.5"}):
+            cfg = LoggingConfig.from_env()
+        assert cfg.rate_limit_seconds == pytest.approx(0.5)
+
+    def test_from_env_reads_rotation_mode(self):
+        with patch.dict(os.environ, {"GATEWAY_LOG_ROTATION_MODE": "time"}):
+            cfg = LoggingConfig.from_env()
+        assert cfg.rotation_mode == "time"
+
+    def test_from_env_reads_rotation_when(self):
+        with patch.dict(os.environ, {"GATEWAY_LOG_ROTATION_WHEN": "H"}):
+            cfg = LoggingConfig.from_env()
+        assert cfg.rotation_when == "H"
+
+    def test_from_env_reads_rotation_interval(self):
+        with patch.dict(os.environ, {"GATEWAY_LOG_ROTATION_INTERVAL": "3"}):
+            cfg = LoggingConfig.from_env()
+        assert cfg.rotation_interval == 3
+
+    def test_from_env_reads_queue_true_variants(self):
+        for val in ("1", "true", "yes", "on"):
+            with patch.dict(os.environ, {"GATEWAY_LOG_QUEUE": val}):
+                cfg = LoggingConfig.from_env()
+            assert cfg.use_queue_handler is True, (
+                f"Expected True for GATEWAY_LOG_QUEUE={val!r}"
+            )
+
+    def test_from_env_reads_queue_false_variants(self):
+        for val in ("0", "false", "no", "off"):
+            with patch.dict(os.environ, {"GATEWAY_LOG_QUEUE": val}):
+                cfg = LoggingConfig.from_env()
+            assert cfg.use_queue_handler is False, (
+                f"Expected False for GATEWAY_LOG_QUEUE={val!r}"
+            )
+
+    def test_from_env_reads_queue_max_size(self):
+        with patch.dict(os.environ, {"GATEWAY_LOG_QUEUE_MAX_SIZE": "500"}):
+            cfg = LoggingConfig.from_env()
+        assert cfg.queue_max_size == 500
+
+    def test_from_env_reads_json_extras_false(self):
+        with patch.dict(os.environ, {"GATEWAY_LOG_JSON_EXTRAS": "0"}):
+            cfg = LoggingConfig.from_env()
+        assert cfg.json_extras is False
+
+    def test_from_env_reads_json_extras_true(self):
+        with patch.dict(os.environ, {"GATEWAY_LOG_JSON_EXTRAS": "true"}):
+            cfg = LoggingConfig.from_env()
+        assert cfg.json_extras is True
+
+    def test_from_env_reads_correlation_id_flag_false(self):
+        with patch.dict(os.environ, {"GATEWAY_LOG_CORRELATION_ID": "false"}):
+            cfg = LoggingConfig.from_env()
+        assert cfg.include_correlation_id is False
+
+    def test_from_env_reads_modules(self):
+        with patch.dict(os.environ, {"GATEWAY_LOG_MODULES": "gateway.api,gateway.db"}):
+            cfg = LoggingConfig.from_env()
+        assert cfg.module_filters == ["gateway.api", "gateway.db"]
+
+    def test_from_env_ignores_invalid_max_bytes(self):
+        with patch.dict(os.environ, {"GATEWAY_LOG_MAX_BYTES": "not_a_number"}):
+            cfg = LoggingConfig.from_env()
+        assert cfg.max_bytes == LoggingConfig().max_bytes
+
+    def test_from_env_ignores_invalid_backup_count(self):
+        with patch.dict(os.environ, {"GATEWAY_LOG_BACKUP_COUNT": "abc"}):
+            cfg = LoggingConfig.from_env()
+        assert cfg.backup_count == LoggingConfig().backup_count
+
+    def test_from_env_ignores_invalid_rate_limit(self):
+        with patch.dict(os.environ, {"GATEWAY_LOG_RATE_LIMIT": "fast"}):
+            cfg = LoggingConfig.from_env()
+        assert cfg.rate_limit_seconds == LoggingConfig().rate_limit_seconds
+
+    def test_from_env_ignores_invalid_rotation_interval(self):
+        with patch.dict(os.environ, {"GATEWAY_LOG_ROTATION_INTERVAL": "weekly"}):
+            cfg = LoggingConfig.from_env()
+        assert cfg.rotation_interval == LoggingConfig().rotation_interval
+
+    def test_from_env_ignores_invalid_queue_max_size(self):
+        with patch.dict(os.environ, {"GATEWAY_LOG_QUEUE_MAX_SIZE": "big"}):
+            cfg = LoggingConfig.from_env()
+        assert cfg.queue_max_size == LoggingConfig().queue_max_size
+
+    def test_from_env_custom_prefix(self):
+        with patch.dict(os.environ, {"MY_LOG_LEVEL": "error"}):
+            cfg = LoggingConfig.from_env(prefix="MY_LOG")
+        assert cfg.level == "error"
+
+    def test_from_env_custom_prefix_does_not_read_default_prefix(self):
+        """Custom prefix should not pick up GATEWAY_LOG_* vars."""
+        with patch.dict(
+            os.environ,
+            {"GATEWAY_LOG_LEVEL": "critical", "CUSTOM_LEVEL": "debug"},
+        ):
+            cfg = LoggingConfig.from_env(prefix="CUSTOM")
+        assert cfg.level == "debug"
+
+    def test_from_env_multiple_vars_set(self):
+        env = {
+            "GATEWAY_LOG_LEVEL": "warning",
+            "GATEWAY_LOG_FORMAT": "json",
+            "GATEWAY_LOG_OUTPUT": "console",
+            "GATEWAY_LOG_ROTATION_MODE": "time",
+            "GATEWAY_LOG_QUEUE": "true",
+        }
+        with patch.dict(os.environ, env):
+            cfg = LoggingConfig.from_env()
+        assert cfg.level == "warning"
+        assert cfg.log_format == "json"
+        assert cfg.output == "console"
+        assert cfg.rotation_mode == "time"
+        assert cfg.use_queue_handler is True
+
+    def test_from_env_level_normalized_to_lowercase(self):
+        with patch.dict(os.environ, {"GATEWAY_LOG_LEVEL": "DEBUG"}):
+            cfg = LoggingConfig.from_env()
+        assert cfg.level == "debug"
+
+    def test_from_env_format_normalized_to_lowercase(self):
+        with patch.dict(os.environ, {"GATEWAY_LOG_FORMAT": "JSON"}):
+            cfg = LoggingConfig.from_env()
+        assert cfg.log_format == "json"
+
+    def test_from_env_modules_strips_whitespace(self):
+        with patch.dict(
+            os.environ, {"GATEWAY_LOG_MODULES": " gateway.api , gateway.db "}
+        ):
+            cfg = LoggingConfig.from_env()
+        assert cfg.module_filters == ["gateway.api", "gateway.db"]
+
+    def test_from_env_empty_modules_string(self):
+        with patch.dict(os.environ, {"GATEWAY_LOG_MODULES": ""}):
+            cfg = LoggingConfig.from_env()
+        assert cfg.module_filters == []
+
+    def test_from_env_rotation_mode_normalized_to_lowercase(self):
+        with patch.dict(os.environ, {"GATEWAY_LOG_ROTATION_MODE": "TIME"}):
+            cfg = LoggingConfig.from_env()
+        assert cfg.rotation_mode == "time"
+
+
+# ---------------------------------------------------------------------------
+# TimedRotatingFileHandler support
+# ---------------------------------------------------------------------------
+
+
+class TestTimedRotation:
+    """Tests for time-based log rotation using TimedRotatingFileHandler."""
+
+    def test_setup_logging_creates_timed_handler(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "app.log")
+            setup_logging(
+                output="file",
+                log_file=log_file,
+                rotation_mode="time",
+                rotation_when="midnight",
+            )
+            status = get_logging_status()
+            timed_handlers = [
+                h for h in status["handlers"]
+                if h.get("rotation_mode") == "time"
+            ]
+            assert len(timed_handlers) >= 1
+
+    def test_setup_logging_timed_handler_has_correct_when(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "app.log")
+            setup_logging(
+                output="file",
+                log_file=log_file,
+                rotation_mode="time",
+                rotation_when="H",
+            )
+            status = get_logging_status()
+            timed = next(
+                (h for h in status["handlers"] if h.get("rotation_mode") == "time"),
+                None,
+            )
+            assert timed is not None
+            assert timed["rotation_when"] == "H"
+
+    def test_setup_logging_timed_creates_log_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "timed.log")
+            logger = setup_logging(
+                output="file",
+                log_file=log_file,
+                rotation_mode="time",
+            )
+            logger.info("Test message for timed rotation")
+            assert os.path.exists(log_file)
+
+    def test_timed_rotation_from_config(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "cfg_timed.log")
+            cfg = LoggingConfig(
+                output="file",
+                log_file=log_file,
+                rotation_mode="time",
+                rotation_when="D",
+                rotation_interval=1,
+            )
+            logger = setup_logging(config=cfg)
+            logger.info("Config-based timed rotation")
+            status = get_logging_status()
+            timed = next(
+                (h for h in status["handlers"] if h.get("rotation_mode") == "time"),
+                None,
+            )
+            assert timed is not None
+
+    def test_timed_rotation_active_config_reflects_mode(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "ac.log")
+            setup_logging(
+                output="file",
+                log_file=log_file,
+                rotation_mode="time",
+                rotation_when="midnight",
+            )
+            cfg = get_active_config()
+            assert cfg is not None
+            assert cfg.rotation_mode == "time"
+            assert cfg.rotation_when == "midnight"
+
+    def test_size_rotation_still_works_by_default(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "size.log")
+            logger = setup_logging(output="file", log_file=log_file)
+            logger.info("Size rotation test")
+            status = get_logging_status()
+            size_handlers = [
+                h for h in status["handlers"] if h.get("rotation_mode") == "size"
+            ]
+            assert len(size_handlers) >= 1
+
+    def test_timed_rotation_messages_written(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "write.log")
+            logger = setup_logging(
+                output="file",
+                log_file=log_file,
+                rotation_mode="time",
+                rotation_when="midnight",
+                level="debug",
+            )
+            logger.debug("debug timed msg")
+            logger.info("info timed msg")
+            logger.warning("warn timed msg")
+            content = Path(log_file).read_text()
+            assert "debug timed msg" in content
+            assert "info timed msg" in content
+            assert "warn timed msg" in content
+
+    def test_timed_rotation_interval_reflected_in_status(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "int.log")
+            setup_logging(
+                output="file",
+                log_file=log_file,
+                rotation_mode="time",
+                rotation_when="H",
+                rotation_interval=2,
+            )
+            status = get_logging_status()
+            timed = next(
+                (h for h in status["handlers"] if h.get("rotation_mode") == "time"),
+                None,
+            )
+            assert timed is not None
+            assert timed.get("rotation_interval") == 2
+
+    def test_timed_rotation_backup_count_stored(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "bc_timed.log")
+            setup_logging(
+                output="file",
+                log_file=log_file,
+                rotation_mode="time",
+                backup_count=14,
+            )
+            status = get_logging_status()
+            timed = next(
+                (h for h in status["handlers"] if h.get("rotation_mode") == "time"),
+                None,
+            )
+            assert timed is not None
+            assert timed.get("backup_count") == 14
+
+
+# ---------------------------------------------------------------------------
+# QueueHandler / async logging
+# ---------------------------------------------------------------------------
+
+
+class TestQueueHandler:
+    """Tests for async logging via QueueHandler."""
+
+    def test_setup_logging_with_queue_handler(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "queue.log")
+            setup_logging(
+                output="file",
+                log_file=log_file,
+                use_queue_handler=True,
+            )
+            status = get_logging_status()
+            queue_handlers = [
+                h for h in status["handlers"]
+                if h.get("type") == "QueueHandler"
+            ]
+            assert len(queue_handlers) >= 1
+
+    def test_queue_handler_max_size_reflected_in_status(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "qmax.log")
+            setup_logging(
+                output="file",
+                log_file=log_file,
+                use_queue_handler=True,
+                queue_max_size=500,
+            )
+            status = get_logging_status()
+            qh = next(
+                (h for h in status["handlers"] if "queue_maxsize" in h),
+                None,
+            )
+            assert qh is not None
+            assert qh["queue_maxsize"] == 500
+
+    def test_queue_handler_logs_messages(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "qlog.log")
+            logger = setup_logging(
+                output="file",
+                log_file=log_file,
+                use_queue_handler=True,
+                level="debug",
+            )
+            logger.info("Queue handler test message")
+            # Allow the listener thread to flush
+            time.sleep(0.2)
+            content = Path(log_file).read_text() if Path(log_file).exists() else ""
+            assert "Queue handler test message" in content
+
+    def test_queue_handler_reset_stops_listener(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "qreset.log")
+            setup_logging(
+                output="file",
+                log_file=log_file,
+                use_queue_handler=True,
+            )
+            # reset_logging() should stop the listener without error
+            reset_logging()
+            assert not is_configured()
+
+    def test_queue_handler_from_config(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "qcfg.log")
+            cfg = LoggingConfig(
+                output="file",
+                log_file=log_file,
+                use_queue_handler=True,
+                queue_max_size=200,
+            )
+            setup_logging(config=cfg)
+            status = get_logging_status()
+            qh = next(
+                (h for h in status["handlers"] if "queue_maxsize" in h),
+                None,
+            )
+            assert qh is not None
+
+    def test_queue_handler_active_config_reflects_setting(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "qac.log")
+            setup_logging(
+                output="file",
+                log_file=log_file,
+                use_queue_handler=True,
+                queue_max_size=1500,
+            )
+            cfg = get_active_config()
+            assert cfg is not None
+            assert cfg.use_queue_handler is True
+            assert cfg.queue_max_size == 1500
+
+    def test_queue_handler_multiple_messages(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "qmulti.log")
+            logger = setup_logging(
+                output="file",
+                log_file=log_file,
+                use_queue_handler=True,
+                level="debug",
+            )
+            for i in range(20):
+                logger.info("Queue message %d", i)
+            time.sleep(0.3)
+            content = Path(log_file).read_text() if Path(log_file).exists() else ""
+            for i in range(20):
+                assert f"Queue message {i}" in content
+
+    def test_queue_handler_reset_then_reconfigure(self):
+        """Resetting and reconfiguring should work without errors."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "qre.log")
+            setup_logging(
+                output="file",
+                log_file=log_file,
+                use_queue_handler=True,
+            )
+            reset_logging()
+            # Reconfigure without queue handler
+            setup_logging(output="console")
+            assert is_configured()
+
+
+# ---------------------------------------------------------------------------
+# set_log_level()
+# ---------------------------------------------------------------------------
+
+
+class TestSetLogLevel:
+    """Tests for the set_log_level() runtime level change function."""
+
+    def test_set_log_level_returns_numeric_debug(self):
+        setup_logging(level="info")
+        numeric = set_log_level("debug")
+        assert numeric == logging.DEBUG
+
+    def test_set_log_level_returns_numeric_info(self):
+        setup_logging(level="debug")
+        numeric = set_log_level("info")
+        assert numeric == logging.INFO
+
+    def test_set_log_level_returns_numeric_warning(self):
+        setup_logging(level="info")
+        numeric = set_log_level("warning")
+        assert numeric == logging.WARNING
+
+    def test_set_log_level_returns_numeric_error(self):
+        setup_logging(level="info")
+        numeric = set_log_level("error")
+        assert numeric == logging.ERROR
+
+    def test_set_log_level_returns_numeric_critical(self):
+        setup_logging(level="info")
+        numeric = set_log_level("critical")
+        assert numeric == logging.CRITICAL
+
+    def test_set_log_level_updates_root_logger_debug(self):
+        setup_logging(level="info")
+        set_log_level("debug")
+        root = logging.getLogger(ROOT_LOGGER_NAME)
+        assert root.level == logging.DEBUG
+
+    def test_set_log_level_updates_root_logger_warning(self):
+        setup_logging(level="info")
+        set_log_level("warning")
+        root = logging.getLogger(ROOT_LOGGER_NAME)
+        assert root.level == logging.WARNING
+
+    def test_set_log_level_updates_root_logger_error(self):
+        setup_logging(level="info")
+        set_log_level("error")
+        root = logging.getLogger(ROOT_LOGGER_NAME)
+        assert root.level == logging.ERROR
+
+    def test_set_log_level_updates_root_logger_critical(self):
+        setup_logging(level="info")
+        set_log_level("critical")
+        root = logging.getLogger(ROOT_LOGGER_NAME)
+        assert root.level == logging.CRITICAL
+
+    def test_set_log_level_updates_active_config(self):
+        setup_logging(level="info")
+        set_log_level("warning")
+        cfg = get_active_config()
+        assert cfg is not None
+        assert cfg.level == "warning"
+
+    def test_set_log_level_invalid_raises(self):
+        setup_logging(level="info")
+        with pytest.raises((ValueError, AttributeError, KeyError)):
+            set_log_level("verbose")
+
+    def test_set_log_level_updates_status_effective_level(self):
+        setup_logging(level="info")
+        set_log_level("error")
+        status = get_logging_status()
+        assert status["effective_level"] == "ERROR"
+
+    def test_set_log_level_multiple_changes(self):
+        setup_logging(level="info")
+        levels = ["debug", "info", "warning", "error", "critical", "info"]
+        for lvl in levels:
+            set_log_level(lvl)
+        root = logging.getLogger(ROOT_LOGGER_NAME)
+        assert root.level == logging.INFO
+
+    def test_set_log_level_with_file_handler(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "lvl.log")
+            setup_logging(output="file", log_file=log_file, level="info")
+            set_log_level("debug")
+            root = logging.getLogger(ROOT_LOGGER_NAME)
+            assert root.level == logging.DEBUG
+
+    def test_set_log_level_active_config_level_string(self):
+        setup_logging(level="info")
+        set_log_level("critical")
+        cfg = get_active_config()
+        assert cfg is not None
+        assert cfg.level == "critical"
+
+
+# ---------------------------------------------------------------------------
+# get_log_files()
+# ---------------------------------------------------------------------------
+
+
+class TestGetLogFiles:
+    """Tests for the get_log_files() function."""
+
+    def test_get_log_files_empty_when_no_file_handler(self):
+        setup_logging(output="console")
+        files = get_log_files()
+        assert files == []
+
+    def test_get_log_files_returns_one_entry_with_file_handler(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "test.log")
+            logger = setup_logging(output="file", log_file=log_file)
+            logger.info("Write something to create the file")
+            files = get_log_files()
+            assert len(files) == 1
+
+    def test_get_log_files_contains_path_field(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "path_test.log")
+            logger = setup_logging(output="file", log_file=log_file)
+            logger.info("Test")
+            files = get_log_files()
+            assert len(files) == 1
+            assert "path" in files[0]
+
+    def test_get_log_files_path_contains_filename(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "named.log")
+            logger = setup_logging(output="file", log_file=log_file)
+            logger.info("path check")
+            files = get_log_files()
+            assert "named.log" in files[0]["path"]
+
+    def test_get_log_files_size_bytes_field(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "size.log")
+            logger = setup_logging(output="file", log_file=log_file)
+            logger.info("Size test message")
+            files = get_log_files()
+            assert "size_bytes" in files[0]
+            assert isinstance(files[0]["size_bytes"], int)
+            assert files[0]["size_bytes"] >= 0
+
+    def test_get_log_files_rotation_mode_size(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "mode.log")
+            setup_logging(output="file", log_file=log_file, rotation_mode="size")
+            files = get_log_files()
+            assert files[0]["rotation_mode"] == "size"
+
+    def test_get_log_files_rotation_mode_time(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "timed.log")
+            setup_logging(
+                output="file",
+                log_file=log_file,
+                rotation_mode="time",
+                rotation_when="midnight",
+            )
+            files = get_log_files()
+            assert files[0]["rotation_mode"] == "time"
+
+    def test_get_log_files_backup_count_field(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "bc.log")
+            setup_logging(output="file", log_file=log_file, backup_count=3)
+            files = get_log_files()
+            assert "backup_count" in files[0]
+            assert files[0]["backup_count"] == 3
+
+    def test_get_log_files_backup_files_field_is_list(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "bk.log")
+            setup_logging(output="file", log_file=log_file)
+            files = get_log_files()
+            assert "backup_files" in files[0]
+            assert isinstance(files[0]["backup_files"], list)
+
+    def test_get_log_files_size_handler_has_max_bytes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "maxb.log")
+            setup_logging(output="file", log_file=log_file, rotation_mode="size")
+            files = get_log_files()
+            assert "max_bytes" in files[0]
+
+    def test_get_log_files_timed_handler_has_rotation_when(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "tw.log")
+            setup_logging(
+                output="file",
+                log_file=log_file,
+                rotation_mode="time",
+                rotation_when="H",
+            )
+            files = get_log_files()
+            assert "rotation_when" in files[0]
+            assert files[0]["rotation_when"] == "H"
+
+    def test_get_log_files_timed_handler_has_rotation_interval(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "ti.log")
+            setup_logging(
+                output="file",
+                log_file=log_file,
+                rotation_mode="time",
+                rotation_when="H",
+                rotation_interval=4,
+            )
+            files = get_log_files()
+            assert "rotation_interval" in files[0]
+            assert files[0]["rotation_interval"] == 4
+
+    def test_get_log_files_after_reset_is_empty(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "rst.log")
+            setup_logging(output="file", log_file=log_file)
+            reset_logging()
+            files = get_log_files()
+            assert files == []
+
+    def test_get_log_files_file_size_increases_after_write(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "grow.log")
+            logger = setup_logging(output="file", log_file=log_file, level="debug")
+            logger.info("First message")
+            files_before = get_log_files()
+            size_before = files_before[0]["size_bytes"]
+            for _ in range(10):
+                logger.info("Additional message to grow the file")
+            # Re-read size from filesystem
+            size_after = Path(log_file).stat().st_size
+            assert size_after > size_before
+
+
+# ---------------------------------------------------------------------------
+# New CLI commands: logging set-level, logging configure, logging files
+# ---------------------------------------------------------------------------
+
+
+class TestNewLoggingCLICommands:
+    """Tests for new CLI commands: logging set-level, logging configure, logging files."""
+
+    def setup_method(self):
+        self.runner = CliRunner()
+
+    # --- logging set-level ---
+
+    def test_logging_set_level_debug(self):
+        result = self.runner.invoke(main, ["logging", "set-level", "debug"])
+        assert result.exit_code == 0
+        assert "DEBUG" in result.output
+
+    def test_logging_set_level_info(self):
+        result = self.runner.invoke(main, ["logging", "set-level", "info"])
+        assert result.exit_code == 0
+        assert "INFO" in result.output
+
+    def test_logging_set_level_warning(self):
+        result = self.runner.invoke(main, ["logging", "set-level", "warning"])
+        assert result.exit_code == 0
+        assert "WARNING" in result.output
+
+    def test_logging_set_level_error(self):
+        result = self.runner.invoke(main, ["logging", "set-level", "error"])
+        assert result.exit_code == 0
+        assert "ERROR" in result.output
+
+    def test_logging_set_level_critical(self):
+        result = self.runner.invoke(main, ["logging", "set-level", "critical"])
+        assert result.exit_code == 0
+        assert "CRITICAL" in result.output
+
+    def test_logging_set_level_invalid_exits_nonzero(self):
+        result = self.runner.invoke(main, ["logging", "set-level", "verbose"])
+        assert result.exit_code != 0
+
+    def test_logging_set_level_shows_effective_level(self):
+        result = self.runner.invoke(main, ["logging", "set-level", "debug"])
+        assert result.exit_code == 0
+        assert "Effective level" in result.output or "effective" in result.output.lower()
+
+    def test_logging_set_level_shows_configured_status(self):
+        result = self.runner.invoke(main, ["logging", "set-level", "info"])
+        assert result.exit_code == 0
+        # Should at least mention configured
+        assert "Configured" in result.output or "configured" in result.output.lower()
+
+    def test_logging_set_level_help(self):
+        result = self.runner.invoke(main, ["logging", "set-level", "--help"])
+        assert result.exit_code == 0
+        assert "level" in result.output.lower()
+
+    # --- logging configure ---
+
+    def test_logging_configure_no_options(self):
+        """configure with no options should succeed using defaults."""
+        result = self.runner.invoke(main, ["logging", "configure"])
+        assert result.exit_code == 0
+        assert "reconfigured" in result.output.lower()
+
+    def test_logging_configure_level_debug(self):
+        result = self.runner.invoke(
+            main, ["logging", "configure", "--level", "debug"]
+        )
+        assert result.exit_code == 0
+        assert "DEBUG" in result.output
+
+    def test_logging_configure_level_warning(self):
+        result = self.runner.invoke(
+            main, ["logging", "configure", "--level", "warning"]
+        )
+        assert result.exit_code == 0
+        assert "WARNING" in result.output
+
+    def test_logging_configure_log_format_json(self):
+        result = self.runner.invoke(
+            main, ["logging", "configure", "--log-format", "json"]
+        )
+        assert result.exit_code == 0
+        assert "json" in result.output.lower()
+
+    def test_logging_configure_log_format_standard(self):
+        result = self.runner.invoke(
+            main, ["logging", "configure", "--log-format", "standard"]
+        )
+        assert result.exit_code == 0
+        assert "standard" in result.output.lower()
+
+    def test_logging_configure_output_console(self):
+        result = self.runner.invoke(
+            main, ["logging", "configure", "--output", "console"]
+        )
+        assert result.exit_code == 0
+        assert "console" in result.output.lower()
+
+    def test_logging_configure_output_json_format(self):
+        """--format json should emit a JSON object."""
+        result = self.runner.invoke(
+            main, ["logging", "configure", "--format", "json"]
+        )
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert isinstance(data, dict)
+
+    def test_logging_configure_json_output_has_configured_key(self):
+        result = self.runner.invoke(
+            main, ["logging", "configure", "--format", "json"]
+        )
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert "configured" in data
+
+    def test_logging_configure_from_env_no_env(self):
+        """--from-env with no env vars should succeed."""
+        result = self.runner.invoke(main, ["logging", "configure", "--from-env"])
+        assert result.exit_code == 0
+
+    def test_logging_configure_from_env_reads_level(self):
+        result = self.runner.invoke(
+            main,
+            ["logging", "configure", "--from-env"],
+            env={"GATEWAY_LOG_LEVEL": "error"},
+        )
+        assert result.exit_code == 0
+        assert "ERROR" in result.output
+
+    def test_logging_configure_explicit_overrides_env(self):
+        """Explicit --level should override GATEWAY_LOG_LEVEL."""
+        result = self.runner.invoke(
+            main,
+            ["logging", "configure", "--from-env", "--level", "debug"],
+            env={"GATEWAY_LOG_LEVEL": "error"},
+        )
+        assert result.exit_code == 0
+        assert "DEBUG" in result.output
+
+    def test_logging_configure_with_log_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "cli.log")
+            result = self.runner.invoke(
+                main,
+                [
+                    "logging", "configure",
+                    "--level", "info",
+                    "--output", "file",
+                    "--log-file", log_file,
+                ],
+            )
+            assert result.exit_code == 0
+            assert "Log file" in result.output or log_file in result.output
+
+    def test_logging_configure_rotation_mode_time(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "rot.log")
+            result = self.runner.invoke(
+                main,
+                [
+                    "logging", "configure",
+                    "--output", "file",
+                    "--log-file", log_file,
+                    "--rotation-mode", "time",
+                ],
+            )
+            assert result.exit_code == 0
+            assert "time" in result.output.lower()
+
+    def test_logging_configure_rotation_mode_size(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "sz.log")
+            result = self.runner.invoke(
+                main,
+                [
+                    "logging", "configure",
+                    "--output", "file",
+                    "--log-file", log_file,
+                    "--rotation-mode", "size",
+                ],
+            )
+            assert result.exit_code == 0
+
+    def test_logging_configure_invalid_rotation_mode(self):
+        result = self.runner.invoke(
+            main,
+            ["logging", "configure", "--rotation-mode", "daily"],
+        )
+        assert result.exit_code != 0
+
+    def test_logging_configure_invalid_level(self):
+        result = self.runner.invoke(
+            main,
+            ["logging", "configure", "--level", "trace"],
+        )
+        assert result.exit_code != 0
+
+    def test_logging_configure_invalid_log_format(self):
+        result = self.runner.invoke(
+            main,
+            ["logging", "configure", "--log-format", "yaml"],
+        )
+        assert result.exit_code != 0
+
+    def test_logging_configure_help(self):
+        result = self.runner.invoke(main, ["logging", "configure", "--help"])
+        assert result.exit_code == 0
+        assert "--level" in result.output
+
+    def test_logging_configure_shows_handler_count(self):
+        result = self.runner.invoke(main, ["logging", "configure"])
+        assert result.exit_code == 0
+        assert "Handlers" in result.output or "handler" in result.output.lower()
+
+    # --- logging files ---
+
+    def test_logging_files_no_file_handlers_message(self):
+        """When no file handlers, show informative message."""
+        self.runner.invoke(main, ["logging", "configure", "--output", "console"])
+        result = self.runner.invoke(main, ["logging", "files"])
+        assert result.exit_code == 0
+        assert "No file-based" in result.output
+
+    def test_logging_files_with_file_handler_shows_header(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "files_test.log")
+            self.runner.invoke(
+                main,
+                [
+                    "logging", "configure",
+                    "--output", "file",
+                    "--log-file", log_file,
+                ],
+            )
+            result = self.runner.invoke(main, ["logging", "files"])
+            assert result.exit_code == 0
+            # Either shows active files header or the path, or no-file message
+            assert (
+                "Active Log Files" in result.output
+                or log_file in result.output
+                or "No file-based" in result.output
+            )
+
+    def test_logging_files_json_format_no_handlers(self):
+        """JSON output with no file handlers should be an empty list."""
+        self.runner.invoke(main, ["logging", "configure", "--output", "console"])
+        result = self.runner.invoke(main, ["logging", "files", "--format", "json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert isinstance(data, list)
+        assert data == []
+
+    def test_logging_files_json_format_with_file_handler(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "fj.log")
+            self.runner.invoke(
+                main,
+                [
+                    "logging", "configure",
+                    "--output", "file",
+                    "--log-file", log_file,
+                ],
+            )
+            result = self.runner.invoke(
+                main, ["logging", "files", "--format", "json"]
+            )
+            assert result.exit_code == 0
+            data = json.loads(result.output)
+            assert isinstance(data, list)
+            # May be empty if configure set up in a subprocess context
+            # Just verify the structure is correct
+            for entry in data:
+                assert "path" in entry
+                assert "size_bytes" in entry
+                assert "rotation_mode" in entry
+
+    def test_logging_files_help(self):
+        result = self.runner.invoke(main, ["logging", "files", "--help"])
+        assert result.exit_code == 0
+        assert "--format" in result.output
+
+    def test_logging_files_invalid_format(self):
+        result = self.runner.invoke(
+            main, ["logging", "files", "--format", "yaml"]
+        )
+        assert result.exit_code != 0

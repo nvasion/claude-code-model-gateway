@@ -1,0 +1,96 @@
+[Unit]
+Description=Claude Code Model Gateway (instance %i)
+Documentation=https://github.com/anthropic/claude-code-model-gateway
+After=network-online.target
+Wants=network-online.target
+# Prevent two identical instances fighting over the same port
+Conflicts=claude-code-model-gateway@%i.service
+
+[Service]
+Type=simple
+User=claude-gateway
+Group=claude-gateway
+
+# Per-instance environment override file:
+#   /etc/claude-code-model-gateway/environment.%i
+# Falls back to the shared environment file if the per-instance file does not
+# exist (the leading '-' suppresses the error).
+EnvironmentFile=-/etc/claude-code-model-gateway/environment
+EnvironmentFile=-/etc/claude-code-model-gateway/environment.%i
+
+# The instance specifier %i is the port number, e.g.
+#   systemctl start claude-code-model-gateway@9090
+# makes the gateway listen on port 9090.
+WorkingDirectory=/opt/claude-code-model-gateway
+
+ExecStartPre=/opt/claude-code-model-gateway/venv/bin/claude-code-model-gateway version
+ExecStart=/opt/claude-code-model-gateway/venv/bin/claude-code-model-gateway gateway \
+    --host ${GATEWAY_HOST:-0.0.0.0} \
+    --port %i \
+    --timeout ${GATEWAY_TIMEOUT:-300} \
+    --log-format ${GATEWAY_LOG_FORMAT:-json} \
+    --log-file ${GATEWAY_LOG_DIR:-/var/log/claude-code-model-gateway}/gateway-%i.log
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStop=/bin/kill -TERM $MAINPID
+
+# Restart policy
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Timeouts
+TimeoutStartSec=30
+TimeoutStopSec=30
+
+# Security hardening (identical to the non-template unit)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+SystemCallArchitectures=native
+
+# File access
+ReadWritePaths=/var/log/claude-code-model-gateway
+ReadWritePaths=/var/lib/claude-code-model-gateway
+ReadOnlyPaths=/etc/claude-code-model-gateway
+ReadOnlyPaths=/opt/claude-code-model-gateway
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Logging (instance logs appear as "claude-code-model-gateway@PORT")
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=claude-code-model-gateway@%i
+
+[Install]
+WantedBy=multi-user.target
+
+# ---------------------------------------------------------------------------
+# Usage examples
+# ---------------------------------------------------------------------------
+# Start a single instance on port 9090:
+#   systemctl start  claude-code-model-gateway@9090
+#   systemctl enable claude-code-model-gateway@9090
+#
+# Start two instances on ports 8080 and 8081:
+#   systemctl start  claude-code-model-gateway@8080
+#   systemctl start  claude-code-model-gateway@8081
+#   systemctl enable claude-code-model-gateway@8080
+#   systemctl enable claude-code-model-gateway@8081
+#
+# Per-instance config (overrides shared environment):
+#   cp /etc/claude-code-model-gateway/environment \
+#      /etc/claude-code-model-gateway/environment.9090
+#   # Edit ANTHROPIC_API_KEY, GATEWAY_TIMEOUT, etc. for that port

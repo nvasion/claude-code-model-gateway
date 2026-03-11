@@ -144,13 +144,24 @@ class ProviderConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ProviderConfig:
-        """Deserialize from dictionary."""
+        """Deserialize from dictionary.
+
+        Supports both dict and list formats for ``models``:
+        - Dict: ``{"model-name": {...}}``
+        - List: ``[{"name": "model-name", ...}]``
+        """
         models = {}
-        for name, model_data in data.get("models", {}).items():
-            if isinstance(model_data, dict):
-                if "name" not in model_data:
-                    model_data["name"] = name
-                models[name] = ModelConfig.from_dict(model_data)
+        models_data = data.get("models", {})
+        if isinstance(models_data, list):
+            for model_data in models_data:
+                if isinstance(model_data, dict) and "name" in model_data:
+                    models[model_data["name"]] = ModelConfig.from_dict(model_data)
+        else:
+            for name, model_data in models_data.items():
+                if isinstance(model_data, dict):
+                    if "name" not in model_data:
+                        model_data["name"] = name
+                    models[name] = ModelConfig.from_dict(model_data)
 
         auth_type_val = data.get("auth_type", "api_key")
         try:
@@ -264,13 +275,26 @@ class GatewayConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> GatewayConfig:
-        """Deserialize from dictionary."""
+        """Deserialize from dictionary.
+
+        Supports both dict and list formats for ``providers``:
+        - Dict: ``{"provider-name": {...}}``
+        - List: ``[{"name": "provider-name", ...}]``
+        """
         providers = {}
-        for name, provider_data in data.get("providers", {}).items():
-            if isinstance(provider_data, dict):
-                if "name" not in provider_data:
-                    provider_data["name"] = name
-                providers[name] = ProviderConfig.from_dict(provider_data)
+        providers_data = data.get("providers", {})
+        if isinstance(providers_data, list):
+            for provider_data in providers_data:
+                if isinstance(provider_data, dict) and "name" in provider_data:
+                    providers[provider_data["name"]] = ProviderConfig.from_dict(
+                        provider_data
+                    )
+        else:
+            for name, provider_data in providers_data.items():
+                if isinstance(provider_data, dict):
+                    if "name" not in provider_data:
+                        provider_data["name"] = name
+                    providers[name] = ProviderConfig.from_dict(provider_data)
 
         return cls(
             default_provider=data.get("default_provider", ""),

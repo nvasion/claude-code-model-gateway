@@ -331,11 +331,11 @@ class TestConfigTestRunner:
     def test_run_file_tests_invalid_file(self, tmp_path):
         """Test running file-based validation on a bad YAML file."""
         path = tmp_path / "bad.yaml"
-        path.write_text(":::invalid yaml:::")
+        path.write_text("[unclosed")
 
         result = ConfigTestRunner.run_file_tests(path)
         assert not result.passed
-        assert "Failed to load" in result.failure_reason
+        assert "Failed to parse" in result.failure_reason
 
     def test_run_file_tests_nonexistent(self, tmp_path):
         """Test running file-based validation on nonexistent file."""
