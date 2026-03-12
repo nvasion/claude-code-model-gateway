@@ -1,5 +1,0 @@
-# systemd-sysusers configuration for claude-code-model-gateway
-# Install to /etc/sysusers.d/claude-code-model-gateway.conf
-
-# Type  Name             ID   GECOS                           Home Dir                         Shell
-u       claude-gateway   -    "Claude Code Model Gateway"     /opt/claude-code-model-gateway   /usr/sbin/nologin

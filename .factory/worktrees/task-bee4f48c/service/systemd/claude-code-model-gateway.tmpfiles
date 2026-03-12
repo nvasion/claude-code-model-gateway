@@ -1,7 +1,0 @@
-# systemd-tmpfiles configuration for claude-code-model-gateway
-# Install to /etc/tmpfiles.d/claude-code-model-gateway.conf
-
-# Type  Path                                    Mode  User             Group            Age  Argument
-d       /var/log/claude-code-model-gateway       0750  claude-gateway   claude-gateway   -    -
-d       /var/lib/claude-code-model-gateway       0750  claude-gateway   claude-gateway   -    -
-d       /run/claude-code-model-gateway           0755  claude-gateway   claude-gateway   -    -
