@@ -57,8 +57,8 @@ class TestBuiltinProviders:
 
     def test_providers_are_fresh_instances(self):
         """Test that each call returns a fresh instance."""
-        p1 = get_builtin_provider("openai", use_cache=False)
-        p2 = get_builtin_provider("openai", use_cache=False)
+        p1 = get_builtin_provider("openai")
+        p2 = get_builtin_provider("openai")
         assert p1 is not p2
         assert p1.name == p2.name
 

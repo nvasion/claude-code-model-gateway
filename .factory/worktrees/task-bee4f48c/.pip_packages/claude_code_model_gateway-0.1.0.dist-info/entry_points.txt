@@ -1,3 +1,0 @@
-[console_scripts]
-claude-code-model-gateway = src.cli:main
-claude-code-model-gateway-service = src.service:main

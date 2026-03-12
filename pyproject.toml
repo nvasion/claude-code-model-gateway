@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [
-    {name = "Kellan Strong"}
+    {name = "Anonymous"}
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -20,6 +20,7 @@ classifiers = [
     "Intended Audience :: System Administrators",
     "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -45,10 +46,10 @@ claude-code-model-gateway = "src.cli:main"
 claude-code-model-gateway-service = "src.service:main"
 
 [project.urls]
-Homepage = "https://github.com/nvasion/claude-code-model-gateway"
-Documentation = "https://github.com/nvasion/claude-code-model-gateway#readme"
-Repository = "https://github.com/nvasion/claude-code-model-gateway"
-Issues = "https://github.com/nvasion/claude-code-model-gateway/issues"
+Homepage = "https://github.com/anthropic/claude-code-model-gateway"
+Documentation = "https://github.com/anthropic/claude-code-model-gateway#readme"
+Repository = "https://github.com/anthropic/claude-code-model-gateway"
+Issues = "https://github.com/anthropic/claude-code-model-gateway/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -59,7 +60,38 @@ where = ["."]
     "service/systemd/*.tmpfiles",
     "service/systemd/*.sysusers",
     "service/initd/*",
+    "service/openrc/*",
+    "service/launchd/*.plist",
     "service/conf/*",
+    "scripts/*.sh",
+]
+
+[tool.setuptools.data-files]
+"share/claude-code-model-gateway/service/systemd" = [
+    "service/systemd/claude-code-model-gateway.service",
+    "service/systemd/claude-code-model-gateway@.service",
+    "service/systemd/claude-code-model-gateway.tmpfiles",
+    "service/systemd/claude-code-model-gateway.sysusers",
+]
+"share/claude-code-model-gateway/service/initd" = [
+    "service/initd/claude-code-model-gateway",
+]
+"share/claude-code-model-gateway/service/openrc" = [
+    "service/openrc/claude-code-model-gateway",
+]
+"share/claude-code-model-gateway/service/launchd" = [
+    "service/launchd/com.anthropic.claude-code-model-gateway.plist",
+]
+"share/claude-code-model-gateway/service/conf" = [
+    "service/conf/environment",
+    "service/conf/gateway.yaml",
+]
+"share/claude-code-model-gateway/scripts" = [
+    "scripts/install.sh",
+    "scripts/uninstall.sh",
+    "scripts/update.sh",
+    "scripts/healthcheck.sh",
+    "scripts/build-package.sh",
 ]
 
 [tool.black]

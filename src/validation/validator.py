@@ -300,7 +300,7 @@ class ConfigValidator:
                     suggestion="Provide a URL like 'https://api.openai.com/v1'.",
                 )
             elif "<" in provider.api_base:
-                # Template URL with <placeholders> — warn before deployment
+                # Template URL with <placeholders> — warn regardless of URL pattern match
                 result.add_warning(
                     f"{prefix}.api_base",
                     "API base contains placeholder(s). "

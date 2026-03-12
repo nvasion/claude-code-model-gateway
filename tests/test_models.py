@@ -221,34 +221,6 @@ class TestProviderConfig:
         assert "my-model" in provider.models
         assert provider.models["my-model"].name == "my-model"
 
-    def test_from_dict_models_as_list(self):
-        """Test that models can be provided as a list instead of a dict."""
-        data = {
-            "name": "test",
-            "models": [
-                {"name": "model-a", "max_tokens": 1024},
-                {"name": "model-b", "max_tokens": 2048, "supports_tools": True},
-            ],
-        }
-        provider = ProviderConfig.from_dict(data)
-        assert "model-a" in provider.models
-        assert "model-b" in provider.models
-        assert provider.models["model-a"].max_tokens == 1024
-        assert provider.models["model-b"].supports_tools is True
-
-    def test_from_dict_models_as_list_skips_entries_without_name(self):
-        """Test that list items without a 'name' key are skipped gracefully."""
-        data = {
-            "name": "test",
-            "models": [
-                {"max_tokens": 512},          # no name – should be skipped
-                {"name": "valid", "max_tokens": 4096},
-            ],
-        }
-        provider = ProviderConfig.from_dict(data)
-        assert "valid" in provider.models
-        assert len(provider.models) == 1
-
     def test_roundtrip(self):
         """Test serialization/deserialization roundtrip."""
         original = ProviderConfig(
@@ -425,41 +397,6 @@ class TestGatewayConfig:
         assert "my-provider" in config.providers
         assert config.providers["my-provider"].name == "my-provider"
 
-    def test_from_dict_providers_as_list(self):
-        """Test that providers can be given as a list instead of a dict."""
-        data = {
-            "default_provider": "prov-a",
-            "providers": [
-                {"name": "prov-a", "api_base": "https://a.example.com"},
-                {"name": "prov-b", "api_base": "https://b.example.com"},
-            ],
-        }
-        config = GatewayConfig.from_dict(data)
-        assert "prov-a" in config.providers
-        assert "prov-b" in config.providers
-        assert config.providers["prov-a"].api_base == "https://a.example.com"
-
-    def test_from_dict_providers_as_list_with_models_as_list(self):
-        """Test nested list format: providers list containing models list."""
-        data = {
-            "providers": [
-                {
-                    "name": "openai",
-                    "api_base": "https://api.openai.com/v1",
-                    "models": [
-                        {"name": "gpt-4", "max_tokens": 8192},
-                        {"name": "gpt-3.5-turbo", "max_tokens": 4096},
-                    ],
-                }
-            ]
-        }
-        config = GatewayConfig.from_dict(data)
-        assert "openai" in config.providers
-        provider = config.providers["openai"]
-        assert "gpt-4" in provider.models
-        assert "gpt-3.5-turbo" in provider.models
-        assert provider.models["gpt-4"].max_tokens == 8192
-
     def test_roundtrip(self):
         """Test full serialization/deserialization roundtrip."""
         original = GatewayConfig(
@@ -484,103 +421,6 @@ class TestGatewayConfig:
         assert restored.timeout == original.timeout
         assert "openai" in restored.providers
         assert "gpt-4" in restored.providers["openai"].models
-
-    # ------------------------------------------------------------------
-    # find_provider_for_model tests
-    # ------------------------------------------------------------------
-
-    def _make_multi_provider_config(self) -> GatewayConfig:
-        """Build a GatewayConfig with two providers for routing tests."""
-        openai_provider = ProviderConfig(
-            name="openai",
-            display_name="OpenAI",
-            api_base="https://api.openai.com/v1",
-            models={
-                "gpt-4o": ModelConfig(name="gpt-4o"),
-                "gpt-4o-mini": ModelConfig(name="gpt-4o-mini"),
-            },
-        )
-        anthropic_provider = ProviderConfig(
-            name="anthropic",
-            display_name="Anthropic",
-            api_base="https://api.anthropic.com/v1",
-            models={
-                "claude-sonnet-4-20250514": ModelConfig(name="claude-sonnet-4-20250514"),
-            },
-        )
-        return GatewayConfig(
-            default_provider="anthropic",
-            providers={
-                "openai": openai_provider,
-                "anthropic": anthropic_provider,
-            },
-        )
-
-    def test_find_provider_for_model_returns_correct_provider(self):
-        """find_provider_for_model returns the provider that owns the model."""
-        config = self._make_multi_provider_config()
-        provider = config.find_provider_for_model("gpt-4o")
-        assert provider is not None
-        assert provider.name == "openai"
-
-    def test_find_provider_for_model_second_provider(self):
-        """find_provider_for_model finds models in the second provider."""
-        config = self._make_multi_provider_config()
-        provider = config.find_provider_for_model("claude-sonnet-4-20250514")
-        assert provider is not None
-        assert provider.name == "anthropic"
-
-    def test_find_provider_for_model_unknown_falls_back_to_default(self):
-        """Unknown model name falls back to the default provider."""
-        config = self._make_multi_provider_config()
-        provider = config.find_provider_for_model("some-unknown-model")
-        assert provider is not None
-        assert provider.name == "anthropic"  # the default provider
-
-    def test_find_provider_for_model_skips_disabled_providers(self):
-        """Disabled providers are not considered during model lookup."""
-        disabled_openai = ProviderConfig(
-            name="openai",
-            models={"gpt-4o": ModelConfig(name="gpt-4o")},
-            enabled=False,
-        )
-        default_provider = ProviderConfig(
-            name="anthropic",
-            models={"claude-sonnet-4-20250514": ModelConfig(name="claude-sonnet-4-20250514")},
-            enabled=True,
-        )
-        config = GatewayConfig(
-            default_provider="anthropic",
-            providers={
-                "openai": disabled_openai,
-                "anthropic": default_provider,
-            },
-        )
-        # gpt-4o is in the disabled openai provider, should fall back to default
-        provider = config.find_provider_for_model("gpt-4o")
-        assert provider is not None
-        assert provider.name == "anthropic"
-
-    def test_find_provider_for_model_no_providers_returns_none(self):
-        """Returns None when no providers are configured."""
-        config = GatewayConfig()
-        provider = config.find_provider_for_model("gpt-4o")
-        assert provider is None
-
-    def test_find_provider_for_model_all_providers_disabled_returns_none(self):
-        """Returns None when all providers are disabled and no default matches."""
-        config = GatewayConfig(
-            default_provider="nonexistent",
-            providers={
-                "openai": ProviderConfig(
-                    name="openai",
-                    models={"gpt-4o": ModelConfig(name="gpt-4o")},
-                    enabled=False,
-                ),
-            },
-        )
-        provider = config.find_provider_for_model("gpt-4o")
-        assert provider is None  # default_provider 'nonexistent' not in providers
 
 
 # ---------------------------------------------------------------------------

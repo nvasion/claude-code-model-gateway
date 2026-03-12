@@ -144,15 +144,20 @@ class ProviderConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ProviderConfig:
-        """Deserialize from dictionary."""
+        """Deserialize from dictionary.
+
+        Supports both dict and list formats for ``models``:
+        - Dict: ``{"model-name": {...}}``
+        - List: ``[{"name": "model-name", ...}]``
+        """
         models = {}
-        raw_models = data.get("models", {})
-        if isinstance(raw_models, list):
-            for model_data in raw_models:
+        models_data = data.get("models", {})
+        if isinstance(models_data, list):
+            for model_data in models_data:
                 if isinstance(model_data, dict) and "name" in model_data:
                     models[model_data["name"]] = ModelConfig.from_dict(model_data)
         else:
-            for name, model_data in raw_models.items():
+            for name, model_data in models_data.items():
                 if isinstance(model_data, dict):
                     if "name" not in model_data:
                         model_data["name"] = name
@@ -224,27 +229,6 @@ class GatewayConfig:
         """Return list of all provider names."""
         return sorted(self.providers.keys())
 
-    def find_provider_for_model(self, model_name: str) -> Optional[ProviderConfig]:
-        """Find which enabled provider owns the given model name.
-
-        Searches all enabled providers for a model matching *model_name*.
-        Falls back to the default provider if no enabled provider claims
-        the model, so that unknown / custom model IDs are still forwarded
-        somewhere useful rather than being dropped.
-
-        Args:
-            model_name: The model ID to look up (e.g., ``'gpt-4o'``).
-
-        Returns:
-            The :class:`ProviderConfig` that owns the model, or the default
-            provider when no enabled provider lists the model.
-        """
-        for provider in self.get_enabled_providers().values():
-            if model_name in provider.models:
-                return provider
-        # No match found — fall back to the default provider.
-        return self.get_provider()
-
     def add_provider(self, provider: ProviderConfig) -> None:
         """Add or update a provider configuration.
 
@@ -291,15 +275,22 @@ class GatewayConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> GatewayConfig:
-        """Deserialize from dictionary."""
+        """Deserialize from dictionary.
+
+        Supports both dict and list formats for ``providers``:
+        - Dict: ``{"provider-name": {...}}``
+        - List: ``[{"name": "provider-name", ...}]``
+        """
         providers = {}
-        raw_providers = data.get("providers", {})
-        if isinstance(raw_providers, list):
-            for provider_data in raw_providers:
+        providers_data = data.get("providers", {})
+        if isinstance(providers_data, list):
+            for provider_data in providers_data:
                 if isinstance(provider_data, dict) and "name" in provider_data:
-                    providers[provider_data["name"]] = ProviderConfig.from_dict(provider_data)
+                    providers[provider_data["name"]] = ProviderConfig.from_dict(
+                        provider_data
+                    )
         else:
-            for name, provider_data in raw_providers.items():
+            for name, provider_data in providers_data.items():
                 if isinstance(provider_data, dict):
                     if "name" not in provider_data:
                         provider_data["name"] = name
