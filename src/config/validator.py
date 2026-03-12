@@ -1,10 +1,29 @@
-"""Unified configuration validation pipeline for the model gateway.
+"""Configuration validation module for claude-code-model-gateway.
 
-Combines schema-level validation (src.config.schema) with semantic
-validation (src.validation.validator) into a configurable pipeline.
+Provides validation presets, rule-based validation, and a unified
+validation pipeline that combines schema-level checks with semantic
+validation from :mod:`src.validation.validator`.
 
-Provides validation profiles (relaxed, default, strict, production)
-and top-level convenience functions.
+This module acts as the config-package entry point for validation,
+bridging the schema definitions in :mod:`src.config.schema` with the
+full validation engine in :mod:`src.validation.validator`.
+
+Example usage::
+
+    from src.config.validator import (
+        quick_validate,
+        full_validate,
+        validate_for_production,
+    )
+
+    # Quick schema-only check
+    errors = quick_validate(config_dict)
+
+    # Full validation with warnings
+    result = full_validate(config_object)
+
+    # Strict production check
+    ok, report = validate_for_production(config_dict)
 """
 
 from __future__ import annotations
@@ -13,143 +32,287 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Optional
 
-from src.models import AuthType, GatewayConfig, ProviderConfig
-from src.validation.validator import ConfigValidator, ValidationResult
+from src.config.schema import GATEWAY_SCHEMA, validate_against_schema
+from src.models import GatewayConfig
+from src.validation.validator import (
+    ConfigValidator,
+    ExtendedValidator,
+    Severity,
+    ValidationMessage,
+    ValidationResult,
+    ValidationRule,
+)
 
 
 # ---------------------------------------------------------------------------
-# ValidationPreset
+# Validation presets
 # ---------------------------------------------------------------------------
 
 
 class ValidationPreset(str, Enum):
-    """Named validation preset levels."""
+    """Pre-configured validation strictness levels."""
 
-    RELAXED = "relaxed"
-    DEFAULT = "default"
-    STRICT = "strict"
-    PRODUCTION = "production"
-
-
-# ---------------------------------------------------------------------------
-# ValidationProfile
-# ---------------------------------------------------------------------------
+    RELAXED = "relaxed"      # Only errors, ignore warnings
+    DEFAULT = "default"      # Errors and warnings
+    STRICT = "strict"        # Errors, warnings, and info
+    PRODUCTION = "production"  # Everything + extra production checks
 
 
 @dataclass
 class ValidationProfile:
-    """A named validation profile with specific rules and behaviour.
+    """A named validation configuration.
 
     Attributes:
-        name: Profile identifier.
-        description: Human-readable description.
-        fail_on_warnings: Whether warnings cause validation to fail.
-        fail_on_info: Whether info messages cause validation to fail.
-        extra_rules: Additional validation callables (config, result) -> None.
+        name: Profile name.
+        description: What this profile checks.
+        fail_on_warnings: Whether warnings cause validation failure.
+        fail_on_info: Whether info messages cause validation failure.
+        extra_rules: Additional validation rules for this profile.
+        skip_rules: Rule names to skip in this profile.
     """
 
     name: str
-    description: str
+    description: str = ""
     fail_on_warnings: bool = False
     fail_on_info: bool = False
-    extra_rules: list[Callable[[GatewayConfig, ValidationResult], None]] = field(
-        default_factory=list
-    )
+    extra_rules: list[ValidationRule] = field(default_factory=list)
+    skip_rules: list[str] = field(default_factory=list)
 
 
-# ---------------------------------------------------------------------------
-# Production extra rules
-# ---------------------------------------------------------------------------
-
-
-def _rule_no_placeholder_urls(config: GatewayConfig, result: ValidationResult) -> None:
-    """Flag api_base URLs that contain placeholder text like <YOUR-NAME>."""
-    for name, provider in config.providers.items():
-        if provider.api_base and "<" in provider.api_base:
-            result.add_error(
-                f"providers.{name}.api_base",
-                "API base URL contains placeholder text. Replace before production use.",
-                provider.api_base,
-            )
-
-
-def _rule_at_least_one_model(config: GatewayConfig, result: ValidationResult) -> None:
-    """Warn if any enabled provider has no models configured."""
-    for name, provider in config.providers.items():
-        if provider.enabled and not provider.models:
-            result.add_warning(
-                f"providers.{name}.models",
-                "Enabled provider has no models configured.",
-                suggestion="Add at least one model definition.",
-            )
-
-
-def _rule_reasonable_timeouts(config: GatewayConfig, result: ValidationResult) -> None:
-    """Warn if timeout is unreasonably low for production use."""
-    if config.timeout < 5:
-        result.add_warning(
-            "timeout",
-            f"Timeout of {config.timeout}s is very low for production use.",
-            config.timeout,
-            "Consider at least 30 seconds for LLM API calls.",
-        )
-
-
-def _rule_api_keys_configured(config: GatewayConfig, result: ValidationResult) -> None:
-    """Warn if enabled providers requiring auth have no api_key_env_var."""
-    for name, provider in config.providers.items():
-        if not provider.enabled:
-            continue
-        if provider.auth_type in (AuthType.API_KEY, AuthType.BEARER_TOKEN):
-            if not provider.api_key_env_var:
-                result.add_warning(
-                    f"providers.{name}.api_key_env_var",
-                    "No API key environment variable set for authenticated provider.",
-                    suggestion=f"Set api_key_env_var to the env var name for {name}'s API key.",
-                )
-
-
-# ---------------------------------------------------------------------------
 # Built-in profiles
-# ---------------------------------------------------------------------------
-
-
 PROFILES: dict[str, ValidationProfile] = {
     "relaxed": ValidationProfile(
         name="relaxed",
-        description="Minimal validation; only errors block deployment.",
+        description="Only fail on errors. Ignore warnings and info.",
         fail_on_warnings=False,
         fail_on_info=False,
     ),
     "default": ValidationProfile(
         name="default",
-        description="Standard validation with errors and warnings.",
+        description="Fail on errors. Report warnings.",
         fail_on_warnings=False,
         fail_on_info=False,
     ),
     "strict": ValidationProfile(
         name="strict",
-        description="Strict validation; warnings are treated as errors.",
+        description="Fail on errors and warnings.",
         fail_on_warnings=True,
         fail_on_info=False,
     ),
     "production": ValidationProfile(
         name="production",
-        description="Production-readiness checks including security and reliability.",
+        description="Strictest: fail on errors and warnings with extra checks.",
         fail_on_warnings=True,
         fail_on_info=False,
-        extra_rules=[
-            _rule_no_placeholder_urls,
-            _rule_at_least_one_model,
-            _rule_reasonable_timeouts,
-            _rule_api_keys_configured,
-        ],
     ),
 }
 
 
 # ---------------------------------------------------------------------------
-# ValidationStep
+# Production-specific validation rules
+# ---------------------------------------------------------------------------
+
+
+def _check_no_placeholder_urls(
+    config: GatewayConfig, result: ValidationResult
+) -> None:
+    """Check that no provider has placeholder URLs."""
+    for name, provider in config.providers.items():
+        if "<" in provider.api_base and ">" in provider.api_base:
+            result.add_error(
+                f"providers.{name}.api_base",
+                "API base URL contains placeholder(s). "
+                "Replace with actual values before deploying.",
+                provider.api_base,
+            )
+
+
+def _check_api_keys_configured(
+    config: GatewayConfig, result: ValidationResult
+) -> None:
+    """Check that enabled providers with auth have API key env vars."""
+    import os
+    from src.models import AuthType
+
+    for name, provider in config.providers.items():
+        if not provider.enabled:
+            continue
+        if provider.auth_type == AuthType.NONE:
+            continue
+        if not provider.api_key_env_var:
+            result.add_warning(
+                f"providers.{name}.api_key_env_var",
+                "No API key environment variable specified.",
+                suggestion="Set api_key_env_var for authenticated providers.",
+            )
+
+
+def _check_at_least_one_model(
+    config: GatewayConfig, result: ValidationResult
+) -> None:
+    """Check that enabled providers have at least one model defined."""
+    for name, provider in config.providers.items():
+        if not provider.enabled:
+            continue
+        if not provider.models:
+            result.add_warning(
+                f"providers.{name}.models",
+                "Enabled provider has no models defined.",
+                suggestion="Add model definitions for explicit configuration.",
+            )
+
+
+def _check_reasonable_timeouts(
+    config: GatewayConfig, result: ValidationResult
+) -> None:
+    """Check that timeout values are reasonable for production."""
+    if config.timeout < 5:
+        result.add_warning(
+            "timeout",
+            "Very low timeout may cause premature request failures.",
+            config.timeout,
+            "Production systems typically use 15-120 seconds.",
+        )
+
+
+_PRODUCTION_RULES: list[ValidationRule] = [
+    ValidationRule(
+        name="no-placeholder-urls",
+        description="Ensure no placeholder URLs remain in provider configs.",
+        check_fn=_check_no_placeholder_urls,
+    ),
+    ValidationRule(
+        name="api-keys-configured",
+        description="Ensure API key env vars are set for authenticated providers.",
+        check_fn=_check_api_keys_configured,
+    ),
+    ValidationRule(
+        name="at-least-one-model",
+        description="Ensure enabled providers have model definitions.",
+        check_fn=_check_at_least_one_model,
+    ),
+    ValidationRule(
+        name="reasonable-timeouts",
+        description="Ensure timeouts are reasonable for production use.",
+        check_fn=_check_reasonable_timeouts,
+    ),
+]
+
+# Add production rules to the production profile
+PROFILES["production"].extra_rules = _PRODUCTION_RULES
+
+
+# ---------------------------------------------------------------------------
+# Public validation functions
+# ---------------------------------------------------------------------------
+
+
+def quick_validate(data: dict[str, Any]) -> list[str]:
+    """Perform a quick schema-level validation on raw config data.
+
+    This is a lightweight check that validates types and constraints
+    without loading the full model. Useful for pre-flight checks
+    before expensive operations.
+
+    Args:
+        data: Raw configuration dictionary.
+
+    Returns:
+        List of error messages (empty if valid).
+    """
+    return validate_against_schema(data)
+
+
+def full_validate(
+    config: GatewayConfig,
+    profile: str = "default",
+) -> ValidationResult:
+    """Run full validation using the specified profile.
+
+    Args:
+        config: The gateway configuration to validate.
+        profile: Validation profile name ('relaxed', 'default',
+                 'strict', 'production').
+
+    Returns:
+        The complete validation result.
+    """
+    vp = PROFILES.get(profile, PROFILES["default"])
+
+    if vp.extra_rules:
+        validator = ExtendedValidator()
+        for rule in vp.extra_rules:
+            if rule.name not in vp.skip_rules:
+                validator.add_rule(rule)
+        result = validator.validate(config)
+    else:
+        result = ConfigValidator.validate(config)
+
+    return result
+
+
+def full_validate_dict(
+    data: dict[str, Any],
+    profile: str = "default",
+) -> ValidationResult:
+    """Run full validation on a raw config dictionary.
+
+    Args:
+        data: Raw configuration dictionary.
+        profile: Validation profile name.
+
+    Returns:
+        The complete validation result.
+    """
+    try:
+        config = GatewayConfig.from_dict(data)
+    except Exception as e:
+        result = ValidationResult()
+        result.add_error("", f"Failed to parse configuration: {e}")
+        return result
+    return full_validate(config, profile=profile)
+
+
+def validate_for_production(
+    data: dict[str, Any],
+) -> tuple[bool, str]:
+    """Validate configuration for production readiness.
+
+    Runs the strictest validation profile and returns a pass/fail
+    result with a formatted report.
+
+    Args:
+        data: Raw configuration dictionary.
+
+    Returns:
+        Tuple of (is_valid, report_string).
+    """
+    result = full_validate_dict(data, profile="production")
+    profile = PROFILES["production"]
+
+    is_valid = result.error_count == 0
+    if profile.fail_on_warnings:
+        is_valid = is_valid and result.warning_count == 0
+
+    report = result.format_report(show_info=True)
+    return is_valid, report
+
+
+def is_valid(data: dict[str, Any]) -> bool:
+    """Quick check whether a config dictionary is valid.
+
+    Args:
+        data: Raw configuration dictionary.
+
+    Returns:
+        True if no errors are found.
+    """
+    result = ConfigValidator.validate_dict(data)
+    return result.is_valid
+
+
+# ---------------------------------------------------------------------------
+# Validation pipeline
 # ---------------------------------------------------------------------------
 
 
@@ -159,245 +322,134 @@ class ValidationStep:
 
     Attributes:
         name: Step identifier.
-        description: Human-readable description.
-        validate_fn: Callable (data, result) -> None that adds messages.
-        required: If True, errors in this step stop subsequent steps.
+        description: What this step checks.
+        validate_fn: Function that takes (data_dict, ValidationResult).
+        required: Whether pipeline aborts if this step fails.
     """
 
     name: str
     description: str
-    validate_fn: Callable[[Any, ValidationResult], None]
+    validate_fn: Callable[[dict[str, Any], ValidationResult], None]
     required: bool = True
 
 
-# ---------------------------------------------------------------------------
-# ValidationPipeline
-# ---------------------------------------------------------------------------
-
-
 class ValidationPipeline:
-    """A configurable chain of validation steps.
+    """An ordered pipeline of validation steps.
 
-    Steps run in registration order. If a required step produces errors,
-    subsequent steps are skipped.
+    Steps are executed in order.  If a required step produces errors,
+    subsequent steps are skipped.  This enables fast-fail validation
+    for expensive downstream checks.
+
+    Example::
+
+        pipeline = ValidationPipeline()
+        pipeline.add_step(ValidationStep(
+            name="schema",
+            description="Schema-level validation",
+            validate_fn=schema_check,
+            required=True,
+        ))
+        pipeline.add_step(ValidationStep(
+            name="semantic",
+            description="Cross-reference checks",
+            validate_fn=semantic_check,
+        ))
+        result = pipeline.run(config_dict)
     """
 
     def __init__(self) -> None:
         self._steps: list[ValidationStep] = []
 
     def add_step(self, step: ValidationStep) -> "ValidationPipeline":
-        """Add a step to the pipeline.
+        """Add a validation step to the pipeline.
+
+        Args:
+            step: The validation step to add.
 
         Returns:
-            self (for method chaining).
+            Self for method chaining.
         """
         self._steps.append(step)
         return self
 
-    def list_steps(self) -> list[str]:
-        """Return step names in order."""
-        return [s.name for s in self._steps]
-
-    def run(self, data: Any) -> ValidationResult:
-        """Execute all steps in order.
+    def run(self, data: dict[str, Any]) -> ValidationResult:
+        """Execute the validation pipeline.
 
         Args:
-            data: The data to validate (dict or GatewayConfig).
+            data: Raw configuration dictionary.
 
         Returns:
-            A ValidationResult containing all messages.
+            Aggregated validation result from all executed steps.
         """
         result = ValidationResult()
 
         for step in self._steps:
+            pre_error_count = result.error_count
             try:
                 step.validate_fn(data, result)
-            except Exception as exc:
+            except Exception as e:
                 result.add_error(
                     f"pipeline.{step.name}",
-                    f"Step '{step.name}' raised an unexpected error: {exc}",
+                    f"Validation step '{step.name}' raised an exception: {e}",
                 )
 
-            # If required step produced errors, stop
-            if step.required and result.error_count > 0:
+            # If a required step produced errors, stop the pipeline
+            if step.required and result.error_count > pre_error_count:
+                result.add_info(
+                    f"pipeline.{step.name}",
+                    f"Pipeline stopped: required step '{step.name}' failed.",
+                )
                 break
 
         return result
 
+    def list_steps(self) -> list[str]:
+        """Return names of all registered steps.
 
-# ---------------------------------------------------------------------------
-# Schema-level quick validation
-# ---------------------------------------------------------------------------
-
-
-def quick_validate(data: dict[str, Any]) -> list[str]:
-    """Run schema-level validation on a raw configuration dict.
-
-    Args:
-        data: Configuration dictionary to validate.
-
-    Returns:
-        List of error strings (empty if valid).
-    """
-    from src.config.schema import validate_against_schema
-
-    return validate_against_schema(data)
-
-
-# ---------------------------------------------------------------------------
-# Full semantic validation
-# ---------------------------------------------------------------------------
-
-
-def full_validate(
-    config: GatewayConfig,
-    profile: str = "default",
-) -> ValidationResult:
-    """Run full semantic validation on a GatewayConfig.
-
-    Args:
-        config: The configuration to validate.
-        profile: Profile name (default, relaxed, strict, production).
-                 Falls back to 'default' if the name is unknown.
-
-    Returns:
-        ValidationResult with all discovered issues.
-    """
-    active_profile = PROFILES.get(profile, PROFILES["default"])
-    result = ConfigValidator.validate(config)
-
-    # Run extra rules for this profile
-    for rule in active_profile.extra_rules:
-        try:
-            rule(config, result)
-        except Exception as exc:
-            result.add_error(
-                "profile_rule",
-                f"Profile rule raised an error: {exc}",
-            )
-
-    return result
-
-
-def full_validate_dict(
-    data: dict[str, Any],
-    profile: str = "default",
-) -> ValidationResult:
-    """Run full semantic validation on a configuration dictionary.
-
-    Parses the dict into a GatewayConfig first; on parse failure,
-    returns a result with a parse error.
-
-    Args:
-        data: Raw configuration dictionary.
-        profile: Profile name.
-
-    Returns:
-        ValidationResult with all discovered issues.
-    """
-    try:
-        config = GatewayConfig.from_dict(data)
-    except Exception as exc:
-        result = ValidationResult()
-        result.add_error("", f"Failed to parse configuration: {exc}")
-        return result
-    return full_validate(config, profile=profile)
-
-
-def validate_for_production(data: dict[str, Any]) -> tuple[bool, str]:
-    """Validate a configuration dict for production readiness.
-
-    Uses the 'production' profile which treats warnings as failures.
-
-    Args:
-        data: Raw configuration dictionary.
-
-    Returns:
-        Tuple of (ok: bool, report: str).
-        ok is True only if there are no errors AND no warnings (production
-        profile has fail_on_warnings=True).
-    """
-    result = full_validate_dict(data, profile="production")
-    production_profile = PROFILES["production"]
-
-    ok = result.is_valid
-    if production_profile.fail_on_warnings and result.warning_count > 0:
-        ok = False
-
-    report = result.format_report(show_info=False)
-    return ok, report
-
-
-def is_valid(data: dict[str, Any]) -> bool:
-    """Quick check: does the configuration have any errors?
-
-    Args:
-        data: Raw configuration dictionary.
-
-    Returns:
-        True if the configuration has no errors.
-    """
-    result = full_validate_dict(data, profile="default")
-    return result.is_valid
-
-
-# ---------------------------------------------------------------------------
-# Default pipeline factory
-# ---------------------------------------------------------------------------
-
-
-def _schema_step(data: Any, result: ValidationResult) -> None:
-    """Pipeline step: schema-level type/constraint checks."""
-    if isinstance(data, dict):
-        errors = quick_validate(data)
-        for error in errors:
-            result.add_error("schema", error)
-
-
-def _semantic_step(data: Any, result: ValidationResult) -> None:
-    """Pipeline step: semantic validation via ConfigValidator."""
-    if isinstance(data, dict):
-        try:
-            config = GatewayConfig.from_dict(data)
-        except Exception as exc:
-            result.add_error("semantic", f"Failed to parse configuration: {exc}")
-            return
-    elif isinstance(data, GatewayConfig):
-        config = data
-    else:
-        result.add_error("semantic", f"Expected dict or GatewayConfig, got {type(data)}")
-        return
-
-    semantic_result = ConfigValidator.validate(config)
-    for msg in semantic_result.messages:
-        result.messages.append(msg)
+        Returns:
+            Ordered list of step names.
+        """
+        return [s.name for s in self._steps]
 
 
 def create_default_pipeline() -> ValidationPipeline:
-    """Create the default two-step validation pipeline.
+    """Create the default validation pipeline.
 
-    Steps:
-    1. 'schema' — schema-level type/constraint checks (required).
-    2. 'semantic' — semantic validation via ConfigValidator (optional).
+    The default pipeline performs:
+    1. Schema-level type and constraint checks
+    2. Full semantic validation via ConfigValidator
 
     Returns:
         A configured ValidationPipeline.
     """
+
+    def schema_step(data: dict[str, Any], result: ValidationResult) -> None:
+        """Run schema-level validation."""
+        errors = validate_against_schema(data)
+        for err in errors:
+            path, _, message = err.partition(": ")
+            result.add_error(path.strip(), message.strip() if message else err)
+
+    def semantic_step(data: dict[str, Any], result: ValidationResult) -> None:
+        """Run full semantic validation."""
+        semantic_result = ConfigValidator.validate_dict(data)
+        result.messages.extend(semantic_result.messages)
+
     pipeline = ValidationPipeline()
     pipeline.add_step(
         ValidationStep(
             name="schema",
-            description="Schema-level type and constraint checks.",
-            validate_fn=_schema_step,
-            required=True,
+            description="Schema-level type and constraint validation",
+            validate_fn=schema_step,
+            required=False,  # Continue even with schema issues
         )
     )
     pipeline.add_step(
         ValidationStep(
             name="semantic",
-            description="Semantic validation for business rules.",
-            validate_fn=_semantic_step,
-            required=False,
+            description="Semantic cross-reference and best-practice checks",
+            validate_fn=semantic_step,
+            required=True,
         )
     )
     return pipeline

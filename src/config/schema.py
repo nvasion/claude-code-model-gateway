@@ -1,19 +1,34 @@
-"""Configuration schema definitions for the model gateway.
+"""Configuration schema definitions for claude-code-model-gateway.
 
-Provides a typed schema for describing, documenting, and validating
-gateway configuration fields.
+Provides a declarative schema describing every configuration field,
+its type, constraints, defaults, and documentation.  The schema is
+used by the validator, documentation generators, and the ``config init``
+command to produce well-documented configuration files.
+
+Example usage::
+
+    from src.config.schema import GATEWAY_SCHEMA, get_field, list_fields
+
+    field = get_field("timeout")
+    print(field.description)  # "Default request timeout in seconds."
+    print(field.default)      # 30
+    print(field.field_type)   # "integer"
 """
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
 
 
+# ---------------------------------------------------------------------------
+# Schema field types
+# ---------------------------------------------------------------------------
+
+
 class FieldType(str, Enum):
-    """Type of a schema field."""
+    """Supported configuration field types."""
 
     STRING = "string"
     INTEGER = "integer"
@@ -26,28 +41,34 @@ class FieldType(str, Enum):
 
 
 class FieldCategory(str, Enum):
-    """Category grouping for schema fields."""
+    """Logical grouping of configuration fields."""
 
     GATEWAY = "gateway"
     PROVIDER = "provider"
     MODEL = "model"
     LOGGING = "logging"
-    SECURITY = "security"
-    PERFORMANCE = "performance"
+    RETRY = "retry"
+    PROXY = "proxy"
+
+
+# ---------------------------------------------------------------------------
+# Schema field definition
+# ---------------------------------------------------------------------------
 
 
 @dataclass
 class FieldConstraint:
-    """Value constraints for a schema field.
+    """Value constraint for a schema field.
 
     Attributes:
         min_value: Minimum numeric value (inclusive).
         max_value: Maximum numeric value (inclusive).
         min_length: Minimum string length.
         max_length: Maximum string length.
-        pattern: Regex pattern a string must match.
-        allowed_values: Explicit set of allowed values.
+        pattern: Regex pattern the value must match.
+        allowed_values: List of allowed enum values.
         required: Whether the field is required.
+        unique: Whether the value must be unique among siblings.
     """
 
     min_value: Optional[float] = None
@@ -55,377 +76,466 @@ class FieldConstraint:
     min_length: Optional[int] = None
     max_length: Optional[int] = None
     pattern: Optional[str] = None
-    allowed_values: Optional[list] = None
+    allowed_values: list[str] = field(default_factory=list)
     required: bool = False
+    unique: bool = False
 
     def validate(self, value: Any) -> list[str]:
-        """Validate a value against these constraints.
+        """Validate a value against this constraint.
+
+        Args:
+            value: The value to validate.
 
         Returns:
-            List of error strings (empty if valid).
+            List of validation error messages (empty if valid).
         """
-        errors = []
+        errors: list[str] = []
 
-        if value is None:
-            return errors
-
-        # Numeric range checks
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            if self.min_value is not None and value < self.min_value:
-                errors.append(f"Value {value} is below minimum {self.min_value}")
-            if self.max_value is not None and value > self.max_value:
-                errors.append(f"Value {value} exceeds maximum {self.max_value}")
-
-        # String checks
-        if isinstance(value, str):
-            if self.min_length is not None and len(value) < self.min_length:
+        if self.min_value is not None and isinstance(value, (int, float)):
+            if value < self.min_value:
                 errors.append(
-                    f"String length {len(value)} is below minimum {self.min_length}"
+                    f"Value {value} is below minimum {self.min_value}."
                 )
-            if self.max_length is not None and len(value) > self.max_length:
-                errors.append(
-                    f"String length {len(value)} exceeds maximum {self.max_length}"
-                )
-            if self.pattern is not None:
-                if not re.match(self.pattern, value):
-                    errors.append(f"Value does not match pattern '{self.pattern}'")
 
-        # Allowed values
-        if self.allowed_values is not None and value not in self.allowed_values:
-            errors.append(
-                f"Value {value!r} is not one of: {self.allowed_values}"
-            )
+        if self.max_value is not None and isinstance(value, (int, float)):
+            if value > self.max_value:
+                errors.append(
+                    f"Value {value} exceeds maximum {self.max_value}."
+                )
+
+        if self.min_length is not None and isinstance(value, str):
+            if len(value) < self.min_length:
+                errors.append(
+                    f"Length {len(value)} is below minimum {self.min_length}."
+                )
+
+        if self.max_length is not None and isinstance(value, str):
+            if len(value) > self.max_length:
+                errors.append(
+                    f"Length {len(value)} exceeds maximum {self.max_length}."
+                )
+
+        if self.pattern is not None and isinstance(value, str):
+            import re
+
+            if not re.match(self.pattern, value):
+                errors.append(
+                    f"Value '{value}' does not match pattern '{self.pattern}'."
+                )
+
+        if self.allowed_values and isinstance(value, str):
+            if value not in self.allowed_values:
+                errors.append(
+                    f"Value '{value}' is not one of: "
+                    f"{', '.join(self.allowed_values)}."
+                )
 
         return errors
 
 
 @dataclass
 class SchemaField:
-    """Description of a single configuration field.
+    """Definition of a single configuration field.
 
     Attributes:
-        name: Field name.
-        field_type: The type of this field.
+        name: Field name (dotted path for nested fields).
+        field_type: Data type of the field.
         description: Human-readable description.
-        default: Default value.
-        constraint: Optional value constraints.
-        env_var: Environment variable that overrides this field.
+        default: Default value when not specified.
+        category: Logical category this field belongs to.
+        constraint: Value constraints for validation.
+        children: Child fields for object/dict types.
         deprecated: Whether this field is deprecated.
-        deprecation_message: Migration guidance.
-        children: Child fields for OBJECT type.
-        category: Category for grouping.
+        deprecation_message: Message shown when deprecated field is used.
+        examples: Example values for documentation.
+        env_var: Environment variable that can override this field.
     """
 
     name: str
     field_type: FieldType
     description: str
     default: Any = None
+    category: FieldCategory = FieldCategory.GATEWAY
     constraint: FieldConstraint = field(default_factory=FieldConstraint)
-    env_var: Optional[str] = None
+    children: dict[str, "SchemaField"] = field(default_factory=dict)
     deprecated: bool = False
     deprecation_message: str = ""
-    children: dict[str, "SchemaField"] = field(default_factory=dict)
-    category: FieldCategory = FieldCategory.GATEWAY
+    examples: list[Any] = field(default_factory=list)
+    env_var: Optional[str] = None
+
+    def get_child(self, name: str) -> Optional["SchemaField"]:
+        """Look up a direct child field by name.
+
+        Args:
+            name: The child field name.
+
+        Returns:
+            The child SchemaField if found, None otherwise.
+        """
+        return self.children.get(name)
 
     def validate_value(self, value: Any) -> list[str]:
         """Validate a value against this field's type and constraints.
 
+        Args:
+            value: The value to validate.
+
         Returns:
-            List of error strings (empty if valid).
+            List of validation error messages (empty if valid).
         """
-        errors = []
+        errors: list[str] = []
 
-        if value is None:
-            return errors  # None skips type checking
+        # Type check
+        expected_types = _FIELD_TYPE_MAP.get(self.field_type)
+        if expected_types and value is not None:
+            if not isinstance(value, expected_types):
+                errors.append(
+                    f"Expected {self.field_type.value}, "
+                    f"got {type(value).__name__}."
+                )
+                return errors  # Skip constraint checks on wrong type
 
-        # Type checking
-        if self.field_type == FieldType.INTEGER:
-            if not isinstance(value, int) or isinstance(value, bool):
-                errors.append(
-                    f"Field '{self.name}' must be an integer, got {type(value).__name__}"
-                )
-        elif self.field_type == FieldType.FLOAT:
-            if not isinstance(value, (int, float)) or isinstance(value, bool):
-                errors.append(
-                    f"Field '{self.name}' must be a float, got {type(value).__name__}"
-                )
-        elif self.field_type == FieldType.STRING:
-            if not isinstance(value, str):
-                errors.append(
-                    f"Field '{self.name}' must be a string, got {type(value).__name__}"
-                )
-        elif self.field_type == FieldType.BOOLEAN:
-            if not isinstance(value, bool):
-                errors.append(
-                    f"Field '{self.name}' must be a boolean, got {type(value).__name__}"
-                )
-        elif self.field_type == FieldType.ENUM:
-            if not isinstance(value, str):
-                errors.append(
-                    f"Field '{self.name}' must be a string (enum), got {type(value).__name__}"
-                )
-        elif self.field_type == FieldType.DICT:
-            if not isinstance(value, dict):
-                errors.append(
-                    f"Field '{self.name}' must be a dict, got {type(value).__name__}"
-                )
-        elif self.field_type == FieldType.LIST:
-            if not isinstance(value, list):
-                errors.append(
-                    f"Field '{self.name}' must be a list, got {type(value).__name__}"
-                )
-
-        # Constraint checks (only if no type error)
-        if not errors and self.constraint:
+        # Constraint check
+        if self.constraint:
             errors.extend(self.constraint.validate(value))
 
         return errors
 
-    def get_child(self, name: str) -> Optional["SchemaField"]:
-        """Get a child field by name."""
-        return self.children.get(name)
-
     def to_dict(self) -> dict[str, Any]:
-        """Serialize to dictionary for documentation."""
-        d: dict[str, Any] = {
+        """Serialize the field definition to a dictionary.
+
+        Returns:
+            Dictionary representation of this schema field.
+        """
+        data: dict[str, Any] = {
             "name": self.name,
             "type": self.field_type.value,
             "description": self.description,
         }
         if self.default is not None:
-            d["default"] = self.default
+            data["default"] = self.default
+        if self.category:
+            data["category"] = self.category.value
+        if self.constraint.required:
+            data["required"] = True
+        if self.constraint.allowed_values:
+            data["allowed_values"] = self.constraint.allowed_values
         if self.env_var:
-            d["env_var"] = self.env_var
+            data["env_var"] = self.env_var
         if self.deprecated:
-            d["deprecated"] = True
-            d["deprecation_message"] = self.deprecation_message
-        if self.constraint:
-            if self.constraint.allowed_values:
-                d["allowed_values"] = self.constraint.allowed_values
-            if self.constraint.min_value is not None:
-                d["min_value"] = self.constraint.min_value
-            if self.constraint.max_value is not None:
-                d["max_value"] = self.constraint.max_value
-            if self.constraint.required:
-                d["required"] = True
+            data["deprecated"] = True
+            if self.deprecation_message:
+                data["deprecation_message"] = self.deprecation_message
+        if self.examples:
+            data["examples"] = self.examples
         if self.children:
-            d["children"] = {k: v.to_dict() for k, v in self.children.items()}
-        return d
+            data["children"] = {
+                k: v.to_dict() for k, v in self.children.items()
+            }
+        return data
+
+
+# Python type mapping for FieldType validation
+_FIELD_TYPE_MAP: dict[FieldType, tuple[type, ...]] = {
+    FieldType.STRING: (str,),
+    FieldType.INTEGER: (int,),
+    FieldType.FLOAT: (int, float),
+    FieldType.BOOLEAN: (bool,),
+    FieldType.DICT: (dict,),
+    FieldType.LIST: (list,),
+}
 
 
 # ---------------------------------------------------------------------------
-# Built-in provider schema
+# Configuration schema
 # ---------------------------------------------------------------------------
 
-MODEL_SCHEMA = SchemaField(
-    name="model",
-    field_type=FieldType.OBJECT,
-    description="Model configuration.",
-    category=FieldCategory.MODEL,
-    children={
-        "name": SchemaField(
-            name="name",
-            field_type=FieldType.STRING,
-            description="Model identifier.",
-            category=FieldCategory.MODEL,
-            constraint=FieldConstraint(required=True),
-        ),
-        "display_name": SchemaField(
-            name="display_name",
-            field_type=FieldType.STRING,
-            description="Human-readable model name.",
-            category=FieldCategory.MODEL,
-        ),
-        "max_tokens": SchemaField(
-            name="max_tokens",
-            field_type=FieldType.INTEGER,
-            description="Maximum token limit for this model.",
-            default=4096,
-            category=FieldCategory.MODEL,
-            constraint=FieldConstraint(min_value=1, max_value=10_000_000),
-        ),
-        "supports_streaming": SchemaField(
-            name="supports_streaming",
-            field_type=FieldType.BOOLEAN,
-            description="Whether the model supports streaming responses.",
-            default=True,
-            category=FieldCategory.MODEL,
-        ),
-        "supports_tools": SchemaField(
-            name="supports_tools",
-            field_type=FieldType.BOOLEAN,
-            description="Whether the model supports tool/function calling.",
-            default=False,
-            category=FieldCategory.MODEL,
-        ),
-        "supports_vision": SchemaField(
-            name="supports_vision",
-            field_type=FieldType.BOOLEAN,
-            description="Whether the model supports vision/image inputs.",
-            default=False,
-            category=FieldCategory.MODEL,
-        ),
-    },
-)
 
-PROVIDER_SCHEMA = SchemaField(
-    name="provider",
-    field_type=FieldType.OBJECT,
-    description="Provider configuration.",
-    category=FieldCategory.PROVIDER,
-    children={
-        "name": SchemaField(
-            name="name",
-            field_type=FieldType.STRING,
-            description="Unique provider identifier.",
-            category=FieldCategory.PROVIDER,
-            constraint=FieldConstraint(required=True),
-        ),
-        "display_name": SchemaField(
-            name="display_name",
-            field_type=FieldType.STRING,
-            description="Human-readable provider name.",
-            category=FieldCategory.PROVIDER,
-        ),
-        "api_base": SchemaField(
-            name="api_base",
-            field_type=FieldType.STRING,
-            description="Base URL for the provider's API.",
-            category=FieldCategory.PROVIDER,
-            constraint=FieldConstraint(required=True),
-        ),
-        "api_key_env_var": SchemaField(
-            name="api_key_env_var",
-            field_type=FieldType.STRING,
-            description="Environment variable containing the API key.",
-            category=FieldCategory.PROVIDER,
-        ),
-        "auth_type": SchemaField(
-            name="auth_type",
-            field_type=FieldType.ENUM,
-            description="Authentication method.",
-            default="api_key",
-            category=FieldCategory.PROVIDER,
-            constraint=FieldConstraint(
-                allowed_values=["api_key", "bearer_token", "none"]
+def _build_model_schema() -> SchemaField:
+    """Build the schema for a single model configuration."""
+    return SchemaField(
+        name="model",
+        field_type=FieldType.OBJECT,
+        description="Configuration for a specific model.",
+        category=FieldCategory.MODEL,
+        children={
+            "name": SchemaField(
+                name="name",
+                field_type=FieldType.STRING,
+                description="The model identifier (e.g., 'gpt-4o', 'claude-sonnet-4-20250514').",
+                constraint=FieldConstraint(required=True, min_length=1),
+                category=FieldCategory.MODEL,
+                examples=["gpt-4o", "claude-sonnet-4-20250514", "gemini-2.0-flash"],
             ),
-        ),
-        "default_model": SchemaField(
-            name="default_model",
-            field_type=FieldType.STRING,
-            description="Default model name for this provider.",
-            category=FieldCategory.PROVIDER,
-        ),
-        "enabled": SchemaField(
-            name="enabled",
-            field_type=FieldType.BOOLEAN,
-            description="Whether this provider is currently enabled.",
-            default=True,
-            category=FieldCategory.PROVIDER,
-        ),
-        "models": SchemaField(
-            name="models",
-            field_type=FieldType.OBJECT,
-            description="Available models for this provider.",
-            category=FieldCategory.PROVIDER,
-            children={"*": MODEL_SCHEMA},
-        ),
-    },
-)
-
-GATEWAY_SCHEMA = SchemaField(
-    name="gateway",
-    field_type=FieldType.OBJECT,
-    description="Top-level gateway configuration.",
-    category=FieldCategory.GATEWAY,
-    children={
-        "default_provider": SchemaField(
-            name="default_provider",
-            field_type=FieldType.STRING,
-            description="Name of the default provider.",
-            default="",
-            category=FieldCategory.GATEWAY,
-        ),
-        "log_level": SchemaField(
-            name="log_level",
-            field_type=FieldType.ENUM,
-            description="Logging verbosity level.",
-            default="info",
-            env_var="GATEWAY_LOG_LEVEL",
-            category=FieldCategory.LOGGING,
-            constraint=FieldConstraint(
-                allowed_values=["debug", "info", "warning", "error", "critical"]
+            "display_name": SchemaField(
+                name="display_name",
+                field_type=FieldType.STRING,
+                description="Human-readable name for the model.",
+                default="",
+                category=FieldCategory.MODEL,
+                examples=["GPT-4o", "Claude Sonnet 4"],
             ),
-        ),
-        "timeout": SchemaField(
-            name="timeout",
-            field_type=FieldType.INTEGER,
-            description="Default request timeout in seconds.",
-            default=30,
-            env_var="GATEWAY_TIMEOUT",
-            category=FieldCategory.PERFORMANCE,
-            constraint=FieldConstraint(min_value=1, max_value=3600),
-        ),
-        "max_retries": SchemaField(
-            name="max_retries",
-            field_type=FieldType.INTEGER,
-            description="Maximum number of retry attempts.",
-            default=3,
-            env_var="GATEWAY_MAX_RETRIES",
-            category=FieldCategory.PERFORMANCE,
-            constraint=FieldConstraint(min_value=0, max_value=100),
-        ),
-        "providers": SchemaField(
-            name="providers",
-            field_type=FieldType.OBJECT,
-            description="Dictionary of provider configurations.",
-            category=FieldCategory.PROVIDER,
-            children={"*": PROVIDER_SCHEMA},
-        ),
-    },
-)
+            "max_tokens": SchemaField(
+                name="max_tokens",
+                field_type=FieldType.INTEGER,
+                description="Maximum token limit for this model.",
+                default=4096,
+                category=FieldCategory.MODEL,
+                constraint=FieldConstraint(min_value=1, max_value=2_000_000),
+                examples=[4096, 8192, 16384, 100000],
+            ),
+            "supports_streaming": SchemaField(
+                name="supports_streaming",
+                field_type=FieldType.BOOLEAN,
+                description="Whether the model supports streaming responses.",
+                default=True,
+                category=FieldCategory.MODEL,
+            ),
+            "supports_tools": SchemaField(
+                name="supports_tools",
+                field_type=FieldType.BOOLEAN,
+                description="Whether the model supports tool/function calling.",
+                default=False,
+                category=FieldCategory.MODEL,
+            ),
+            "supports_vision": SchemaField(
+                name="supports_vision",
+                field_type=FieldType.BOOLEAN,
+                description="Whether the model supports vision/image inputs.",
+                default=False,
+                category=FieldCategory.MODEL,
+            ),
+            "extra": SchemaField(
+                name="extra",
+                field_type=FieldType.DICT,
+                description="Additional model-specific configuration.",
+                default={},
+                category=FieldCategory.MODEL,
+            ),
+        },
+    )
+
+
+def _build_provider_schema() -> SchemaField:
+    """Build the schema for a single provider configuration."""
+    return SchemaField(
+        name="provider",
+        field_type=FieldType.OBJECT,
+        description="Configuration for a model provider.",
+        category=FieldCategory.PROVIDER,
+        children={
+            "name": SchemaField(
+                name="name",
+                field_type=FieldType.STRING,
+                description="Unique identifier for this provider.",
+                constraint=FieldConstraint(required=True, min_length=1),
+                category=FieldCategory.PROVIDER,
+                examples=["openai", "anthropic", "azure", "google"],
+            ),
+            "display_name": SchemaField(
+                name="display_name",
+                field_type=FieldType.STRING,
+                description="Human-readable provider name.",
+                default="",
+                category=FieldCategory.PROVIDER,
+            ),
+            "api_base": SchemaField(
+                name="api_base",
+                field_type=FieldType.STRING,
+                description="Base URL for the provider's API.",
+                constraint=FieldConstraint(
+                    required=True,
+                    pattern=r"^https?://\S+$",
+                ),
+                category=FieldCategory.PROVIDER,
+                examples=[
+                    "https://api.openai.com/v1",
+                    "https://api.anthropic.com/v1",
+                ],
+            ),
+            "api_key_env_var": SchemaField(
+                name="api_key_env_var",
+                field_type=FieldType.STRING,
+                description="Environment variable name containing the API key.",
+                default="",
+                category=FieldCategory.PROVIDER,
+                examples=["OPENAI_API_KEY", "ANTHROPIC_API_KEY"],
+            ),
+            "auth_type": SchemaField(
+                name="auth_type",
+                field_type=FieldType.ENUM,
+                description="Authentication method used by this provider.",
+                default="api_key",
+                constraint=FieldConstraint(
+                    allowed_values=["api_key", "bearer_token", "none"],
+                ),
+                category=FieldCategory.PROVIDER,
+            ),
+            "default_model": SchemaField(
+                name="default_model",
+                field_type=FieldType.STRING,
+                description="Default model to use for this provider.",
+                default="",
+                category=FieldCategory.PROVIDER,
+            ),
+            "models": SchemaField(
+                name="models",
+                field_type=FieldType.DICT,
+                description="Dictionary of available models keyed by model name.",
+                default={},
+                category=FieldCategory.PROVIDER,
+                children={"*": _build_model_schema()},
+            ),
+            "headers": SchemaField(
+                name="headers",
+                field_type=FieldType.DICT,
+                description="Additional HTTP headers to include in requests.",
+                default={},
+                category=FieldCategory.PROVIDER,
+            ),
+            "extra": SchemaField(
+                name="extra",
+                field_type=FieldType.DICT,
+                description="Additional provider-specific configuration.",
+                default={},
+                category=FieldCategory.PROVIDER,
+            ),
+            "enabled": SchemaField(
+                name="enabled",
+                field_type=FieldType.BOOLEAN,
+                description="Whether this provider is currently enabled.",
+                default=True,
+                category=FieldCategory.PROVIDER,
+            ),
+        },
+    )
+
+
+def _build_gateway_schema() -> SchemaField:
+    """Build the complete gateway configuration schema."""
+    return SchemaField(
+        name="gateway",
+        field_type=FieldType.OBJECT,
+        description="Top-level gateway configuration.",
+        category=FieldCategory.GATEWAY,
+        children={
+            "default_provider": SchemaField(
+                name="default_provider",
+                field_type=FieldType.STRING,
+                description="Name of the default provider to use.",
+                default="",
+                category=FieldCategory.GATEWAY,
+                env_var="GATEWAY_DEFAULT_PROVIDER",
+                examples=["openai", "anthropic"],
+            ),
+            "providers": SchemaField(
+                name="providers",
+                field_type=FieldType.DICT,
+                description="Dictionary of configured providers keyed by name.",
+                default={},
+                category=FieldCategory.PROVIDER,
+                children={"*": _build_provider_schema()},
+            ),
+            "log_level": SchemaField(
+                name="log_level",
+                field_type=FieldType.ENUM,
+                description="Logging level.",
+                default="info",
+                constraint=FieldConstraint(
+                    allowed_values=[
+                        "debug",
+                        "info",
+                        "warning",
+                        "error",
+                        "critical",
+                    ],
+                ),
+                category=FieldCategory.LOGGING,
+                env_var="GATEWAY_LOG_LEVEL",
+            ),
+            "timeout": SchemaField(
+                name="timeout",
+                field_type=FieldType.INTEGER,
+                description="Default request timeout in seconds.",
+                default=30,
+                constraint=FieldConstraint(min_value=1, max_value=600),
+                category=FieldCategory.GATEWAY,
+                env_var="GATEWAY_TIMEOUT",
+                examples=[30, 60, 120],
+            ),
+            "max_retries": SchemaField(
+                name="max_retries",
+                field_type=FieldType.INTEGER,
+                description="Default number of retries for failed requests.",
+                default=3,
+                constraint=FieldConstraint(min_value=0, max_value=20),
+                category=FieldCategory.RETRY,
+                env_var="GATEWAY_MAX_RETRIES",
+                examples=[0, 3, 5],
+            ),
+            "extra": SchemaField(
+                name="extra",
+                field_type=FieldType.DICT,
+                description="Additional gateway-wide configuration.",
+                default={},
+                category=FieldCategory.GATEWAY,
+            ),
+        },
+    )
+
+
+# The canonical gateway configuration schema instance.
+GATEWAY_SCHEMA: SchemaField = _build_gateway_schema()
+
+# Convenience: provider and model sub-schemas.
+PROVIDER_SCHEMA: SchemaField = _build_provider_schema()
+MODEL_SCHEMA: SchemaField = _build_model_schema()
 
 
 # ---------------------------------------------------------------------------
-# Schema helper functions
+# Public helpers
 # ---------------------------------------------------------------------------
 
 
-def get_field(
-    path: str, schema: Optional[SchemaField] = None
-) -> Optional[SchemaField]:
-    """Get a schema field by dotted path (supports * wildcards).
+def get_field(path: str) -> Optional[SchemaField]:
+    """Look up a schema field by dotted path.
 
     Args:
-        path: Dotted path like 'timeout' or 'providers.*.api_base'.
-        schema: Schema to search in. Defaults to GATEWAY_SCHEMA.
+        path: Dotted path such as 'timeout', 'providers', or
+              'providers.*.models.*.max_tokens'.
 
     Returns:
-        The SchemaField at the given path, or None if not found.
+        The matching SchemaField, or None if the path is invalid.
     """
-    if schema is None:
-        schema = GATEWAY_SCHEMA
-
     parts = path.split(".")
-    current = schema
-
+    current = GATEWAY_SCHEMA
     for part in parts:
-        if not current.children:
+        child = current.get_child(part)
+        if child is None:
+            # Try wildcard
+            child = current.get_child("*")
+        if child is None:
             return None
-        if part in current.children:
-            current = current.children[part]
-        elif "*" in current.children:
-            current = current.children["*"]
-            # If part is not a literal child of the wildcard's children,
-            # look in the wildcard field's children for this part
-            if part not in current.children and "*" not in current.children:
-                return None
-            # If the current part is a key inside the wildcard schema's children
-            # we don't advance again - we've already moved to the wildcard schema
-        else:
-            return None
-
+        current = child
     return current
+
+
+def list_fields(
+    category: Optional[FieldCategory] = None,
+    include_nested: bool = True,
+) -> list[SchemaField]:
+    """List all schema fields, optionally filtered by category.
+
+    Args:
+        category: Filter to only fields in this category.
+        include_nested: Whether to include nested child fields.
+
+    Returns:
+        List of matching SchemaField instances.
+    """
+    result: list[SchemaField] = []
+    _collect_fields(GATEWAY_SCHEMA, category, include_nested, result)
+    return result
 
 
 def _collect_fields(
@@ -433,175 +543,161 @@ def _collect_fields(
     category: Optional[FieldCategory],
     include_nested: bool,
     result: list[SchemaField],
-    _depth: int = 0,
 ) -> None:
-    """Recursively collect schema fields."""
-    if _depth > 0:  # Don't include the root schema itself
-        if category is None or schema.category == category:
-            result.append(schema)
-    if include_nested or _depth == 0:
+    """Recursively collect fields from a schema tree."""
+    if category is None or schema.category == category:
+        result.append(schema)
+    if include_nested:
         for child in schema.children.values():
-            if child.name == "*":
-                # Expand wildcard children
-                _collect_fields(child, category, include_nested, result, _depth + 1)
-            else:
-                _collect_fields(child, category, include_nested, result, _depth + 1)
+            _collect_fields(child, category, include_nested, result)
 
 
-def list_fields(
-    category: Optional[FieldCategory] = None,
-    include_nested: bool = True,
-    schema: Optional[SchemaField] = None,
-) -> list[SchemaField]:
-    """List schema fields, optionally filtered by category.
-
-    Args:
-        category: Optional category filter.
-        include_nested: Whether to include nested fields (provider/model).
-        schema: Schema to list from. Defaults to GATEWAY_SCHEMA.
+def get_defaults() -> dict[str, Any]:
+    """Extract default values from the schema into a flat dictionary.
 
     Returns:
-        List of SchemaField objects.
+        Dictionary of field name to default value for all fields
+        that have defaults defined.
     """
-    if schema is None:
-        schema = GATEWAY_SCHEMA
-    result: list[SchemaField] = []
-    _collect_fields(schema, category, include_nested, result)
-    return result
-
-
-def get_defaults(schema: Optional[SchemaField] = None) -> dict[str, Any]:
-    """Get all default values from the schema.
-
-    Args:
-        schema: Schema to extract defaults from. Defaults to GATEWAY_SCHEMA.
-
-    Returns:
-        Dict mapping field name to default value.
-    """
-    if schema is None:
-        schema = GATEWAY_SCHEMA
-
     defaults: dict[str, Any] = {}
-
-    def _collect(s: SchemaField, prefix: str = "") -> None:
-        if s.default is not None:
-            key = f"{prefix}{s.name}" if prefix else s.name
-            defaults[key] = s.default
-        for child in s.children.values():
-            if child.name != "*":
-                _collect(child, "")
-
-    _collect(schema)
+    _collect_defaults(GATEWAY_SCHEMA, "", defaults)
     return defaults
+
+
+def _collect_defaults(
+    schema: SchemaField, prefix: str, defaults: dict[str, Any]
+) -> None:
+    """Recursively collect default values."""
+    path = f"{prefix}.{schema.name}" if prefix else schema.name
+    if schema.default is not None:
+        defaults[path] = schema.default
+    for child in schema.children.values():
+        if child.name != "*":
+            _collect_defaults(child, path, defaults)
+
+
+def generate_documented_config() -> str:
+    """Generate a documented YAML configuration template.
+
+    Returns:
+        A multi-line YAML string with comments explaining each field.
+    """
+    lines: list[str] = [
+        "# Claude Code Model Gateway Configuration",
+        "# Generated from schema definitions",
+        "#",
+        "# See documentation for full details on each field.",
+        "",
+    ]
+    _generate_documented_yaml(GATEWAY_SCHEMA, lines, indent=0, skip_root=True)
+    return "\n".join(lines) + "\n"
+
+
+def _generate_documented_yaml(
+    schema: SchemaField,
+    lines: list[str],
+    indent: int,
+    skip_root: bool = False,
+) -> None:
+    """Recursively generate documented YAML lines."""
+    prefix = "  " * indent
+    if not skip_root:
+        # Comment with description
+        lines.append(f"{prefix}# {schema.description}")
+        if schema.constraint.allowed_values:
+            lines.append(
+                f"{prefix}# Allowed values: "
+                f"{', '.join(schema.constraint.allowed_values)}"
+            )
+        if schema.env_var:
+            lines.append(f"{prefix}# Env override: {schema.env_var}")
+        if schema.examples:
+            examples_str = ", ".join(str(e) for e in schema.examples[:3])
+            lines.append(f"{prefix}# Examples: {examples_str}")
+
+        # The field itself
+        if schema.default is not None and schema.field_type not in (
+            FieldType.DICT,
+            FieldType.OBJECT,
+        ):
+            default_val = schema.default
+            if isinstance(default_val, bool):
+                default_val = str(default_val).lower()
+            elif isinstance(default_val, str) and default_val:
+                default_val = f'"{default_val}"'
+            elif isinstance(default_val, str) and not default_val:
+                default_val = '""'
+            lines.append(f"{prefix}{schema.name}: {default_val}")
+        elif schema.field_type in (FieldType.DICT, FieldType.OBJECT):
+            if schema.children and not all(
+                c.name == "*" for c in schema.children.values()
+            ):
+                lines.append(f"{prefix}{schema.name}:")
+            else:
+                lines.append(f"{prefix}{schema.name}: {{}}")
+        else:
+            lines.append(f"{prefix}{schema.name}: null")
+        lines.append("")
+
+    # Process non-wildcard children
+    for child in schema.children.values():
+        if child.name != "*":
+            _generate_documented_yaml(child, lines, indent if skip_root else indent + 1)
 
 
 def validate_against_schema(
     data: dict[str, Any],
     schema: Optional[SchemaField] = None,
 ) -> list[str]:
-    """Validate a configuration dict against a schema.
+    """Validate a raw config dictionary against the schema.
+
+    Performs type-level validation and constraint checking based on
+    the schema definitions.  This is a lighter-weight check than the
+    full ``ConfigValidator`` -- suitable for quick pre-flight checks.
 
     Args:
-        data: Configuration dictionary to validate.
-        schema: Schema to validate against. Defaults to GATEWAY_SCHEMA.
+        data: Raw configuration dictionary.
+        schema: Schema to validate against.  Defaults to GATEWAY_SCHEMA.
 
     Returns:
-        List of error strings (empty if valid).
+        List of validation error messages (empty if valid).
     """
     if schema is None:
         schema = GATEWAY_SCHEMA
-
     errors: list[str] = []
-    _validate_dict(data, schema, "", errors)
+    _validate_dict_against_schema(data, schema, "", errors)
     return errors
 
 
-def _validate_dict(
+def _validate_dict_against_schema(
     data: dict[str, Any],
     schema: SchemaField,
-    path_prefix: str,
+    path: str,
     errors: list[str],
 ) -> None:
-    """Recursively validate a dict against a schema."""
+    """Recursively validate a dict against a schema field."""
     for key, value in data.items():
-        field_schema = schema.children.get(key) or schema.children.get("*")
-        if field_schema is None:
-            continue  # Unknown fields are ignored
-
-        field_path = f"{path_prefix}.{key}" if path_prefix else key
-
-        if field_schema.name == "*":
-            # Wildcard: value should be a dict of items matching the wildcard schema
-            if isinstance(value, dict):
-                for sub_key, sub_value in value.items():
-                    sub_path = f"{field_path}.{sub_key}"
-                    if isinstance(sub_value, dict):
-                        _validate_dict(sub_value, field_schema, sub_path, errors)
-                    else:
-                        errs = field_schema.validate_value(sub_value)
-                        errors.extend(f"{sub_path}: {e}" for e in errs)
+        current_path = f"{path}.{key}" if path else key
+        child = schema.get_child(key)
+        if child is None:
+            child = schema.get_child("*")
+        if child is None:
+            # Unknown field -- not necessarily an error for extensible configs
             continue
 
-        # Type and constraint validation
-        errs = field_schema.validate_value(value)
-        errors.extend(f"{field_path}: {e}" for e in errs)
+        # Validate the value
+        field_errors = child.validate_value(value)
+        for err in field_errors:
+            errors.append(f"{current_path}: {err}")
 
-        # Recurse into dicts for OBJECT fields
-        if (
-            field_schema.field_type == FieldType.OBJECT
-            and isinstance(value, dict)
-            and field_schema.children
-        ):
-            _validate_dict(value, field_schema, field_path, errors)
+        # Recurse into dicts
+        if isinstance(value, dict) and child.children:
+            _validate_dict_against_schema(value, child, current_path, errors)
 
-
-def generate_documented_config() -> str:
-    """Generate a documented YAML template showing all configuration options.
-
-    Returns:
-        A YAML string with inline comments documenting each field.
-    """
-    lines = [
-        "# claude-code-model-gateway Configuration",
-        "# Generated documentation of all available configuration options.",
-        "#",
-    ]
-
-    def _add_field(f: SchemaField, indent: int = 0) -> None:
-        prefix = "  " * indent
-
-        if f.name in ("*", "gateway"):
-            return
-
-        # Comment block
-        lines.append(f"{prefix}# {f.description}")
-        if f.env_var:
-            lines.append(f"{prefix}# Env override: {f.env_var}")
-        if f.constraint and f.constraint.allowed_values:
-            vals = ", ".join(str(v) for v in f.constraint.allowed_values)
-            lines.append(f"{prefix}# Allowed values: {vals}")
-        if f.constraint and f.constraint.min_value is not None:
-            lines.append(f"{prefix}# Min: {f.constraint.min_value}")
-        if f.constraint and f.constraint.max_value is not None:
-            lines.append(f"{prefix}# Max: {f.constraint.max_value}")
-        if f.deprecated:
-            lines.append(f"{prefix}# DEPRECATED: {f.deprecation_message}")
-
-        if f.default is not None:
-            lines.append(f"{prefix}{f.name}: {f.default}")
-        elif f.field_type == FieldType.OBJECT:
-            lines.append(f"{prefix}{f.name}:")
-            for child in f.children.values():
-                if child.name != "*":
-                    _add_field(child, indent + 1)
-        else:
-            lines.append(f"{prefix}{f.name}:  # {f.field_type.value}")
-
-        lines.append("")
-
-    for child in GATEWAY_SCHEMA.children.values():
-        _add_field(child)
-
-    lines.append("")
-    return "\n".join(lines) + "\n"
+    # Check required fields
+    for child_name, child_schema in schema.children.items():
+        if child_name == "*":
+            continue
+        if child_schema.constraint.required and child_name not in data:
+            child_path = f"{path}.{child_name}" if path else child_name
+            errors.append(f"{child_path}: Required field is missing.")

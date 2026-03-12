@@ -6,29 +6,6 @@ This file provides guidance to Claude Code when working on this project.
 
 claude-code-model-gateway is a command-line application built with Python using the Click framework.
 
-### Persona 
-Senior software engineer/architect who reads and refactors existing code before creating new                                                                                                                                                                      
-#### Core Principles:
-  - Read Before You Write — understand existing code, check for duplicates, refactor over recreate
-  - Test Everything — tests for every feature, run the full suite, regression tests for bug fixes
-  - Keep Documentation Current — README.md always reflects current state, document all changes
-  - Code Quality — simple readable code, follow established conventions, lint after every change, explicit error handling
-  - No Unnecessary Complexity — no over-engineering, no premature abstractions, no unrequested features
-
-## README Maintenance (MANDATORY)
-
-**After every code change, always update `README.md` to reflect the current state.**
-
-This is non-negotiable. Do not complete any task without verifying `README.md` is accurate:
-
-- New CLI command or option added → update CLI Reference table and Quick Start examples
-- New/changed module → update Project Structure section
-- New/changed configuration key or env var → update Configuration section
-- New dependency → update Requirements section
-- Behaviour change → update any affected examples or descriptions
-
-The README is the source of truth for users and must never lag behind the code.
-
 ## Development Commands
 
 ### Installation
@@ -61,36 +38,12 @@ claude-code-model-gateway              # Run installed command
 
 ## Architecture
 
-Full module layout — read all relevant files before editing:
+This is a standard Click CLI application structure:
 
-```
-src/
-├── __init__.py              # Package version
-├── main.py                  # CLI entry point (calls cli.main)
-├── cli.py                   # Click command definitions (gateway, config, validate, …)
-├── service.py               # Service daemon (SIGTERM/SIGHUP handling)
-├── proxy.py                 # HTTP proxy / reverse-proxy server
-├── anthropic_passthrough.py # Anthropic-specific passthrough logic
-├── providers.py             # Built-in provider definitions (Anthropic, OpenAI, Azure)
-├── models.py                # GatewayConfig, ProviderConfig, ModelConfig dataclasses
-├── errors.py                # Typed error hierarchy with retryable classification
-├── retry.py                 # Retry logic & backoff strategies
-├── cache.py                 # Thread-safe LRU cache with TTL
-├── logging_config.py        # Structured logging (standard/detailed/json/colored)
-├── config/                  # Configuration loading & validation sub-package
-│   ├── __init__.py
-│   ├── loader.py
-│   ├── schema.py
-│   ├── validator.py
-│   └── testing.py
-└── validation/              # Request validation sub-package
-    ├── __init__.py
-    ├── validator.py
-    └── testing.py
-tests/                       # pytest test suite (mirrors src/ structure)
-service/                     # systemd / init.d service definitions + conf templates
-scripts/                     # install.sh, uninstall.sh, healthcheck.sh
-```
+- `src/__init__.py` - Package initialization with version
+- `src/main.py` - Entry point that calls cli.main()
+- `src/cli.py` - CLI commands using Click decorators
+- `tests/` - Test files using pytest
 
 ## Code Style
 
@@ -124,21 +77,15 @@ def process(filename: str, output: str):
 
 ## Dependencies
 
-Runtime (`pyproject.toml > dependencies`):
-- `click >= 8.1.0` - CLI framework
-- `pyyaml >= 6.0` - YAML configuration parsing
-
-Dev (`pyproject.toml > optional-dependencies > dev`):
-- `pytest` / `pytest-cov` - Testing framework & coverage
-- `black` - Code formatter (line length: 88)
+- `click` - CLI framework (similar to Cobra for Go)
+- `pytest` - Testing framework
+- `black` - Code formatter
 - `ruff` - Fast Python linter
-- `build` - Package build tool
 
 Add new dependencies:
 ```bash
 pip install package-name
-# Then add to pyproject.toml [project.dependencies] (runtime)
-# or [project.optional-dependencies] dev (dev-only)
+# Then add to pyproject.toml dependencies
 ```
 
 ## Testing

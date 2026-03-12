@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Callable
 
 from src.models import AuthType, ModelConfig, ProviderConfig
@@ -230,6 +231,28 @@ def _bedrock_provider() -> ProviderConfig:
     )
 
 
+def _local_provider() -> ProviderConfig:
+    """Create the default local/Ollama provider configuration."""
+    return ProviderConfig(
+        name="local",
+        display_name="Ollama",
+        api_base="http://localhost:11434/v1",
+        api_key_env_var="",
+        auth_type=AuthType.BEARER_TOKEN,
+        default_model="llama3",
+        models={
+            "llama3": ModelConfig(
+                name="llama3",
+                display_name="LLaMA 3",
+                max_tokens=4096,
+                supports_streaming=True,
+                supports_tools=False,
+                supports_vision=False,
+            ),
+        },
+    )
+
+
 # Registry of all built-in provider factory functions
 _BUILTIN_PROVIDERS: dict[str, Callable[[], ProviderConfig]] = {
     "openai": _openai_provider,
@@ -237,6 +260,7 @@ _BUILTIN_PROVIDERS: dict[str, Callable[[], ProviderConfig]] = {
     "azure": _azure_openai_provider,
     "google": _google_provider,
     "bedrock": _bedrock_provider,
+    "local": _local_provider,
 }
 
 
@@ -291,7 +315,7 @@ def get_builtin_provider(name: str, use_cache: bool = True) -> ProviderConfig | 
 
         cached_value = get_provider_cache().get(cache_key)
         if cached_value is not None:
-            return cached_value
+            return copy.deepcopy(cached_value)
 
     factory = _BUILTIN_PROVIDERS.get(name)
     if factory is None:
@@ -304,7 +328,7 @@ def get_builtin_provider(name: str, use_cache: bool = True) -> ProviderConfig | 
 
         get_provider_cache().set(cache_key, result)
 
-    return result
+    return copy.deepcopy(result)
 
 
 def list_builtin_providers() -> list[str]:

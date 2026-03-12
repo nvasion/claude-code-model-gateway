@@ -26,7 +26,6 @@ class ConfigTestCase:
         name: Short descriptive name for the test case.
         description: Longer explanation of what this test checks.
         config_data: The configuration dictionary to test.
-        config: A pre-built GatewayConfig to test directly (alternative to config_data).
         expect_valid: Whether this config is expected to pass validation.
         expect_errors_at: List of config paths expected to have errors.
         expect_warnings_at: List of config paths expected to have warnings.
@@ -35,7 +34,6 @@ class ConfigTestCase:
     name: str
     description: str = ""
     config_data: dict[str, Any] = field(default_factory=dict)
-    config: Any = None  # Optional[GatewayConfig] — avoids circular import issues
     expect_valid: bool = True
     expect_errors_at: list[str] = field(default_factory=list)
     expect_warnings_at: list[str] = field(default_factory=list)
@@ -209,13 +207,12 @@ class ConfigTestRunner:
             test_case.config_data = data
         except ConfigError as e:
             validation = ValidationResult()
-            failure_reason = f"Failed to load config: {e}"
-            validation.add_error("", failure_reason)
+            validation.add_error("", f"Failed to load config: {e}")
             return ConfigTestResult(
                 test_case=test_case,
                 passed=False,
                 validation_result=validation,
-                failure_reason=failure_reason,
+                failure_reason=str(e),
             )
 
         return cls.run_test(test_case)
@@ -415,43 +412,6 @@ def _deep_merge(base: dict, override: dict) -> None:
             _deep_merge(base[key], value)
         else:
             base[key] = value
-
-
-def run_test_suite(test_cases: list[ConfigTestCase]) -> "ConfigTestSuiteResult":
-    """Run a list of ConfigTestCase objects and return aggregated results.
-
-    Supports both dict-based (config_data) and GatewayConfig-based (config)
-    test cases. When a ``config`` attribute is set on the test case, it is
-    validated directly; otherwise ``config_data`` is used.
-
-    Args:
-        test_cases: List of test cases to execute.
-
-    Returns:
-        Aggregated ConfigTestSuiteResult.
-    """
-    suite_result = ConfigTestSuiteResult()
-    for tc in test_cases:
-        if tc.config is not None:
-            # Validate the GatewayConfig object directly
-            val_result = ConfigValidator.validate(tc.config)
-            passed = val_result.is_valid == tc.expect_valid
-            suite_result.results.append(
-                ConfigTestResult(
-                    test_case=tc,
-                    passed=passed,
-                    validation_result=val_result,
-                    failure_reason=(
-                        ""
-                        if passed
-                        else f"Expected valid={tc.expect_valid}, got {val_result.is_valid}"
-                    ),
-                )
-            )
-        else:
-            result = ConfigTestRunner.run_test(tc)
-            suite_result.results.append(result)
-    return suite_result
 
 
 def get_builtin_test_cases() -> list[ConfigTestCase]:
