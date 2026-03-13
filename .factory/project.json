@@ -1,18 +1,19 @@
 {
-  "id": "a906b76b-a589-4401-ab69-335bae460031",
+  "id": "ee425ce1-9195-47c0-9704-df2a09d1bf63",
   "name": "claude-code-model-gateway",
   "language": "python",
   "type": "terminal",
-  "factory_version": "latest",
+  "factory_version": "1.0.0",
   "owner_id": "ea0c552a-7854-44bb-ad3b-e26b9a9f6781",
-  "created_at": "2026-02-25T19:28:22.669746408Z",
-  "updated_at": "2026-02-26T20:32:19.00566585Z",
+  "org_id": "c1a465ce-360a-47d0-8014-4a0d0a3a3863",
+  "created_at": "2026-03-13T04:56:54.492694091Z",
+  "updated_at": "2026-03-13T04:56:54.492694091Z",
   "git": {
     "connected": true,
-    "remote_url": "https://github.com/nvasion/claude-code-model-gateway.git",
+    "remote_url": "https://github.com/nvasion/claude-code-model-gateway",
     "branch": "main",
     "repo_name": "claude-code-model-gateway",
     "repo_owner": "nvasion",
-    "connected_at": "2026-02-26T20:32:19.00554372Z"
+    "connected_at": "2026-03-13T04:56:54.492694091Z"
   }
 }

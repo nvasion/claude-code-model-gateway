@@ -43,4 +43,4 @@ venv/
 
 # Service runtime (not tracked)
 *.pid
-.factory/worktrees/
+.factory/
