@@ -231,6 +231,107 @@ def _bedrock_provider() -> ProviderConfig:
     )
 
 
+def _openrouter_provider() -> ProviderConfig:
+    """Create the default OpenRouter provider configuration.
+
+    OpenRouter exposes an OpenAI-compatible Chat Completions endpoint that
+    routes requests to hundreds of underlying models from Anthropic, OpenAI,
+    Google, Meta, Mistral, and others.  The gateway uses the OpenAI translator
+    for all OpenRouter traffic.
+
+    The OpenRouter-specific headers ``HTTP-Referer`` and ``X-Title`` are
+    optional but encouraged; users can set ``OPENROUTER_HTTP_REFERER`` and
+    ``OPENROUTER_TITLE`` environment variables if they want them forwarded.
+    """
+    return ProviderConfig(
+        name="openrouter",
+        display_name="OpenRouter",
+        api_base="https://openrouter.ai/api/v1",
+        api_key_env_var="OPENROUTER_API_KEY",
+        auth_type=AuthType.BEARER_TOKEN,
+        default_model="anthropic/claude-sonnet-4",
+        models={
+            # Claude models via OpenRouter
+            "anthropic/claude-sonnet-4": ModelConfig(
+                name="anthropic/claude-sonnet-4",
+                display_name="Claude Sonnet 4 (OpenRouter)",
+                max_tokens=8192,
+                supports_streaming=True,
+                supports_tools=True,
+                supports_vision=True,
+            ),
+            "anthropic/claude-3-5-sonnet": ModelConfig(
+                name="anthropic/claude-3-5-sonnet",
+                display_name="Claude 3.5 Sonnet (OpenRouter)",
+                max_tokens=8192,
+                supports_streaming=True,
+                supports_tools=True,
+                supports_vision=True,
+            ),
+            "anthropic/claude-3-5-haiku": ModelConfig(
+                name="anthropic/claude-3-5-haiku",
+                display_name="Claude 3.5 Haiku (OpenRouter)",
+                max_tokens=8192,
+                supports_streaming=True,
+                supports_tools=True,
+                supports_vision=False,
+            ),
+            "anthropic/claude-3-opus": ModelConfig(
+                name="anthropic/claude-3-opus",
+                display_name="Claude 3 Opus (OpenRouter)",
+                max_tokens=4096,
+                supports_streaming=True,
+                supports_tools=True,
+                supports_vision=True,
+            ),
+            # OpenAI models via OpenRouter
+            "openai/gpt-4o": ModelConfig(
+                name="openai/gpt-4o",
+                display_name="GPT-4o (OpenRouter)",
+                max_tokens=16384,
+                supports_streaming=True,
+                supports_tools=True,
+                supports_vision=True,
+            ),
+            "openai/gpt-4o-mini": ModelConfig(
+                name="openai/gpt-4o-mini",
+                display_name="GPT-4o Mini (OpenRouter)",
+                max_tokens=16384,
+                supports_streaming=True,
+                supports_tools=True,
+                supports_vision=True,
+            ),
+            # Google models via OpenRouter
+            "google/gemini-2.0-flash": ModelConfig(
+                name="google/gemini-2.0-flash",
+                display_name="Gemini 2.0 Flash (OpenRouter)",
+                max_tokens=8192,
+                supports_streaming=True,
+                supports_tools=True,
+                supports_vision=True,
+            ),
+            # Meta models via OpenRouter
+            "meta-llama/llama-3.3-70b-instruct": ModelConfig(
+                name="meta-llama/llama-3.3-70b-instruct",
+                display_name="LLaMA 3.3 70B (OpenRouter)",
+                max_tokens=8192,
+                supports_streaming=True,
+                supports_tools=True,
+                supports_vision=False,
+            ),
+            # Free tier models for cost-conscious routing
+            "mistralai/mistral-7b-instruct:free": ModelConfig(
+                name="mistralai/mistral-7b-instruct:free",
+                display_name="Mistral 7B (OpenRouter Free)",
+                max_tokens=4096,
+                supports_streaming=True,
+                supports_tools=False,
+                supports_vision=False,
+            ),
+        },
+    )
+
+
 def _local_provider() -> ProviderConfig:
     """Create the default local/Ollama provider configuration."""
     return ProviderConfig(
@@ -260,7 +361,14 @@ _BUILTIN_PROVIDERS: dict[str, Callable[[], ProviderConfig]] = {
     "azure": _azure_openai_provider,
     "google": _google_provider,
     "bedrock": _bedrock_provider,
+    "openrouter": _openrouter_provider,
     "local": _local_provider,
+}
+
+# Aliases map alternative names to canonical provider names.
+# These allow users to run `provider add gemini` instead of `provider add google`.
+_PROVIDER_ALIASES: dict[str, str] = {
+    "gemini": "google",
 }
 
 
@@ -298,17 +406,20 @@ def get_builtin_providers(use_cache: bool = True) -> dict[str, ProviderConfig]:
 def get_builtin_provider(name: str, use_cache: bool = True) -> ProviderConfig | None:
     """Get a specific built-in provider configuration.
 
+    Resolves aliases (e.g. ``"gemini"`` → ``"google"``) transparently.
     When *use_cache* is ``True`` (the default), the provider config is
     returned from an in-memory cache.
 
     Args:
-        name: The provider name (e.g., 'openai', 'anthropic').
+        name: The provider name or alias (e.g., 'openai', 'gemini').
         use_cache: Whether to use the in-memory provider cache.
 
     Returns:
         The ProviderConfig if found, None otherwise.
     """
-    cache_key = f"builtin_provider:{name}"
+    # Resolve alias first
+    canonical_name = _PROVIDER_ALIASES.get(name, name)
+    cache_key = f"builtin_provider:{canonical_name}"
 
     if use_cache:
         from src.cache import get_provider_cache
@@ -317,7 +428,7 @@ def get_builtin_provider(name: str, use_cache: bool = True) -> ProviderConfig | 
         if cached_value is not None:
             return copy.deepcopy(cached_value)
 
-    factory = _BUILTIN_PROVIDERS.get(name)
+    factory = _BUILTIN_PROVIDERS.get(canonical_name)
     if factory is None:
         return None
 
@@ -331,13 +442,21 @@ def get_builtin_provider(name: str, use_cache: bool = True) -> ProviderConfig | 
     return copy.deepcopy(result)
 
 
-def list_builtin_providers() -> list[str]:
+def list_builtin_providers(include_aliases: bool = False) -> list[str]:
     """List all available built-in provider names.
+
+    Args:
+        include_aliases: If ``True``, also include alias names (e.g. ``"gemini"``
+            for ``"google"``).  Defaults to ``False`` so that only canonical
+            provider names are returned.
 
     Returns:
         Sorted list of built-in provider names.
     """
-    return sorted(_BUILTIN_PROVIDERS.keys())
+    names = set(_BUILTIN_PROVIDERS.keys())
+    if include_aliases:
+        names |= set(_PROVIDER_ALIASES.keys())
+    return sorted(names)
 
 
 def create_custom_provider(

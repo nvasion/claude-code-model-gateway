@@ -84,6 +84,22 @@ class TestRegistryBuiltinProviders:
         assert t is not None
         assert isinstance(t, BedrockTranslator)
 
+    def test_get_openrouter(self, registry):
+        """OpenRouter uses the OpenAI-compatible translator."""
+        t = registry.get("openrouter")
+        assert t is not None
+        assert isinstance(t, OpenAITranslator)
+
+    def test_get_local(self, registry):
+        """Local / Ollama uses the OpenAI-compatible translator."""
+        t = registry.get("local")
+        assert t is not None
+        assert isinstance(t, OpenAITranslator)
+
+    def test_openrouter_in_list_providers(self, registry):
+        """openrouter should appear in the list of known providers."""
+        assert "openrouter" in registry.list_providers()
+
     def test_get_unknown_returns_none(self, registry):
         assert registry.get("nonexistent-provider") is None
 

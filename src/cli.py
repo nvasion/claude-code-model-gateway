@@ -1708,7 +1708,9 @@ def provider_show(name: str, config_file: Optional[str]):
 )
 @click.option(
     "--from-builtin",
-    type=click.Choice(["openai", "anthropic", "azure", "google", "bedrock"]),
+    type=click.Choice(
+        ["openai", "anthropic", "azure", "google", "gemini", "bedrock", "openrouter", "local"]
+    ),
     default=None,
     help="Initialize from a built-in provider template.",
 )

@@ -12,7 +12,7 @@ Claude Code communicates with the Anthropic Messages API. This gateway speaks th
 - **Unify audit logging** — every request flowing through Claude Code lands in one structured log, regardless of provider
 - **Enforce budgets** — set per-client rate limits so a runaway agent doesn't burn your quota
 
-Supported upstream providers: **Anthropic**, **OpenAI**, **Google Gemini**, **AWS Bedrock**.
+Supported upstream providers: **Anthropic**, **OpenAI**, **OpenRouter**, **Google Gemini**, **AWS Bedrock**, **Azure OpenAI**, **Ollama** (local).
 
 ---
 
@@ -30,12 +30,13 @@ pip install -e .
 # Create a starter config
 claude-code-model-gateway config init
 
-# Add your providers
-claude-code-model-gateway provider add anthropic   # reads ANTHROPIC_API_KEY
-claude-code-model-gateway provider add openai      # reads OPENAI_API_KEY
-claude-code-model-gateway provider add gemini      # reads GEMINI_API_KEY
+# Add your providers — pick the ones you want
+claude-code-model-gateway provider add anthropic    # reads ANTHROPIC_API_KEY
+claude-code-model-gateway provider add openai       # reads OPENAI_API_KEY
+claude-code-model-gateway provider add openrouter   # reads OPENROUTER_API_KEY
+claude-code-model-gateway provider add gemini       # reads GOOGLE_API_KEY
 
-# Set Anthropic as default, OpenAI as fallback
+# Set Anthropic as default, OpenRouter as fallback
 claude-code-model-gateway provider set-default anthropic
 ```
 
@@ -84,6 +85,43 @@ claude-code-model-gateway route add "gpt-4o-mini"     --provider openai
 claude-code-model-gateway route add "*"               --provider gemini
 ```
 
+### OpenRouter: access hundreds of models through a single endpoint
+
+[OpenRouter](https://openrouter.ai/) aggregates 200+ models from Anthropic, OpenAI, Google,
+Meta, Mistral, and others behind a single OpenAI-compatible endpoint.
+Point the gateway at OpenRouter and let it handle the upstream routing:
+
+```bash
+# Add OpenRouter as a provider (set OPENROUTER_API_KEY first)
+claude-code-model-gateway provider add openrouter
+
+# Route cheap summarisation tasks to a free-tier model, everything else to Claude
+claude-code-model-gateway route add "mistralai/mistral-7b-instruct:free" --provider openrouter
+claude-code-model-gateway route add "*"                                   --provider anthropic
+```
+
+Or use OpenRouter exclusively and choose models by capability:
+
+```bash
+# All Claude Code requests go to OpenRouter; model selection happens there
+claude-code-model-gateway provider add openrouter
+claude-code-model-gateway provider set-default openrouter
+claude-code-model-gateway gateway --response-cache
+```
+
+Then point Claude Code at the gateway:
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
+export OPENROUTER_API_KEY=sk-or-...
+claude  # Claude Code → gateway → OpenRouter → the model you chose
+```
+
+OpenRouter uses an OpenAI-compatible API, so the gateway's OpenAI translator
+handles all request/response conversion automatically.
+
+---
+
 ### Resilience: fall back to OpenAI when Anthropic is rate-limited
 
 The gateway retries on 429/502/503/504 before surfacing an error:
@@ -127,8 +165,9 @@ docker-compose up -d
 |---|---|---|
 | `ANTHROPIC_BASE_URL` | Claude Code | Point Claude Code at the gateway (`http://127.0.0.1:8080`) |
 | `ANTHROPIC_API_KEY` | Anthropic provider | Anthropic API key |
-| `OPENAI_API_KEY` | OpenAI provider | OpenAI API key |
-| `GEMINI_API_KEY` | Gemini provider | Google Gemini API key |
+| `OPENAI_API_KEY` | OpenAI / Azure provider | OpenAI API key |
+| `OPENROUTER_API_KEY` | OpenRouter provider | OpenRouter API key (get one at openrouter.ai) |
+| `GOOGLE_API_KEY` | Gemini provider | Google AI API key |
 | `AWS_ACCESS_KEY_ID` | Bedrock provider | AWS access key |
 | `AWS_SECRET_ACCESS_KEY` | Bedrock provider | AWS secret key |
 | `AWS_DEFAULT_REGION` | Bedrock provider | AWS region (e.g. `us-east-1`) |
@@ -159,10 +198,16 @@ providers:
     api_key_env_var: OPENAI_API_KEY
     enabled: true
 
-  gemini:
-    name: gemini
+  openrouter:
+    name: openrouter
+    api_base: https://openrouter.ai/api/v1
+    api_key_env_var: OPENROUTER_API_KEY
+    enabled: true
+
+  google:
+    name: google
     api_base: https://generativelanguage.googleapis.com/v1beta
-    api_key_env_var: GEMINI_API_KEY
+    api_key_env_var: GOOGLE_API_KEY
     enabled: true
 ```
 
@@ -269,7 +314,7 @@ claude-code-model-gateway provider disable openai              # Disable a provi
 claude-code-model-gateway provider update anthropic --priority 1  # Update provider settings
 ```
 
-Supported built-in providers: `anthropic`, `openai`, `gemini`, `bedrock`.
+Supported built-in providers: `anthropic`, `openai`, `azure`, `openrouter`, `google` (alias: `gemini`), `bedrock`, `local` (Ollama).
 
 ---
 
@@ -494,41 +539,47 @@ ruff check --fix src tests
 ```
 claude-code-model-gateway/
 ├── src/
-│   ├── __init__.py                  # Package init with version
-│   ├── main.py                      # Entry point
-│   ├── cli.py                       # All CLI commands
-│   ├── gateway.py                   # Multi-provider routing gateway
-│   ├── proxy.py                     # HTTP proxy implementation
-│   ├── anthropic_passthrough.py     # Anthropic API pass-through
-│   ├── router.py                    # Request routing
-│   ├── interceptor.py               # Request/response interception
-│   ├── providers.py                 # Provider management
-│   ├── models.py                    # Data models
-│   ├── cache.py                     # Caching layer
-│   ├── response_cache.py            # Response caching
-│   ├── token_count_cache.py         # Token count caching
-│   ├── retry.py                     # Retry logic
-│   ├── retry_budget.py              # Retry budget management
-│   ├── error_handling.py            # Error handling & health tracking
-│   ├── error_recovery_strategies.py # Recovery strategies
-│   ├── errors.py                    # Custom exceptions
-│   ├── logging_config.py            # Logging configuration
-│   ├── service.py                   # Daemon/service entry point
-│   ├── config/                      # Configuration management
-│   │   ├── loader.py
-│   │   ├── manager.py
-│   │   ├── validator.py
-│   │   └── schema.py
-│   ├── translators/                 # Per-provider API translators
-│   │   ├── anthropic.py
-│   │   ├── openai.py
-│   │   ├── gemini.py
-│   │   └── bedrock.py
-│   └── validation/                  # Request validation utilities
-├── tests/                           # pytest test suite (42 files)
-├── service/                         # Service files (systemd, initd, openrc, launchd)
-├── scripts/                         # Install/update/healthcheck scripts
-├── examples/                        # Usage examples
+│   ├── __init__.py                   # Package init with version
+│   ├── main.py                       # Entry point
+│   ├── cli.py                        # All CLI commands
+│   ├── gateway.py                    # Multi-provider routing gateway
+│   ├── proxy.py                      # HTTP forward proxy
+│   ├── anthropic_passthrough.py      # Anthropic API pass-through
+│   ├── router.py                     # Request routing engine
+│   ├── interceptor.py                # Request/response interception
+│   ├── providers.py                  # Built-in provider registry
+│   ├── models.py                     # Data models (ProviderConfig, etc.)
+│   ├── cache.py                      # In-memory caching layer
+│   ├── response_cache.py             # Response caching
+│   ├── token_count_cache.py          # Token count caching
+│   ├── retry.py                      # Retry logic with backoff
+│   ├── retry_budget.py               # Per-client retry budgets
+│   ├── error_handling.py             # Error handling & health tracking
+│   ├── error_recovery_strategies.py  # Recovery strategies
+│   ├── errors.py                     # Custom exceptions
+│   ├── logging_config.py             # Structured logging configuration
+│   ├── service.py                    # Daemon/service entry point
+│   ├── config/                       # Configuration management
+│   │   ├── loader.py                 # YAML config loader
+│   │   ├── manager.py                # Config state manager
+│   │   ├── validator.py              # Config validator
+│   │   ├── schema.py                 # Config schema definitions
+│   │   └── testing.py                # Test helpers
+│   ├── translators/                  # Per-provider API translators
+│   │   ├── base.py                   # BaseTranslator ABC
+│   │   ├── registry.py               # Translator registry / singleton
+│   │   ├── types.py                  # Canonical request/response types
+│   │   ├── anthropic.py              # Anthropic Messages API translator
+│   │   ├── openai.py                 # OpenAI / Azure / OpenRouter translator
+│   │   ├── gemini.py                 # Google Gemini translator
+│   │   └── bedrock.py                # AWS Bedrock translator
+│   └── validation/                   # Request validation utilities
+│       ├── validator.py
+│       └── testing.py
+├── tests/                            # pytest test suite
+├── service/                          # Service files (systemd, initd, openrc, launchd)
+├── scripts/                          # Install/update/healthcheck scripts
+├── examples/                         # Usage examples
 ├── Dockerfile
 ├── docker-compose.yaml
 ├── pyproject.toml

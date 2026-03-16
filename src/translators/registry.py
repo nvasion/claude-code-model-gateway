@@ -18,6 +18,10 @@ Built-in mappings
 +------------------+-------------------------------------------------+
 | ``"azure"``      | :class:`~src.translators.openai.AzureOpenAITranslator`|
 +------------------+-------------------------------------------------+
+| ``"openrouter"`` | :class:`~src.translators.openai.OpenAITranslator`|
++------------------+-------------------------------------------------+
+| ``"local"``      | :class:`~src.translators.openai.OpenAITranslator`|
++------------------+-------------------------------------------------+
 | ``"anthropic"``  | :class:`~src.translators.anthropic.AnthropicTranslator`|
 +------------------+-------------------------------------------------+
 | ``"google"``     | :class:`~src.translators.gemini.GeminiTranslator`|
@@ -95,7 +99,7 @@ class TranslatorRegistry:
         Returns ``None`` if *name* is not a known built-in.
         """
         # Import lazily to avoid circular imports and startup overhead
-        if name in ("openai",):
+        if name in ("openai", "openrouter", "local"):
             from src.translators.openai import OpenAITranslator
 
             return OpenAITranslator()
@@ -124,7 +128,16 @@ class TranslatorRegistry:
 
     def _load_all_builtins(self) -> None:
         """Eagerly instantiate all built-in translators."""
-        for name in ("openai", "azure", "anthropic", "google", "gemini", "bedrock"):
+        for name in (
+            "openai",
+            "azure",
+            "openrouter",
+            "local",
+            "anthropic",
+            "google",
+            "gemini",
+            "bedrock",
+        ):
             if name not in self._translators:
                 translator = self._get_builtin_translator(name)
                 if translator is not None:
@@ -237,7 +250,16 @@ class TranslatorRegistry:
     def list_providers(self) -> List[str]:
         """Return a sorted list of all registered provider names."""
         # Combine explicitly registered names with known built-ins
-        builtin_names = {"openai", "azure", "anthropic", "google", "gemini", "bedrock"}
+        builtin_names = {
+            "openai",
+            "azure",
+            "openrouter",
+            "local",
+            "anthropic",
+            "google",
+            "gemini",
+            "bedrock",
+        }
         with self._lock:
             registered = set(self._translators.keys())
         return sorted(registered | builtin_names)
