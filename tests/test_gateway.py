@@ -605,6 +605,9 @@ class TestGatewayForwarding:
             )
             resp = urllib.request.urlopen(req, timeout=5)
             assert resp.status == 200
+            # Allow a brief window for the gateway's background thread to
+            # finish updating stats *after* the response body has been sent.
+            time.sleep(0.05)
             stats: GatewayStats = server.stats  # type: ignore[attr-defined]
             assert stats.to_dict()["provider_counts"].get("provider_b", 0) >= 1
         finally:

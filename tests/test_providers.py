@@ -20,7 +20,7 @@ class TestBuiltinProviders:
     """Tests for the built-in provider registry."""
 
     def test_list_builtin_providers(self):
-        """Test listing available built-in providers."""
+        """Test listing available built-in providers (canonical names only)."""
         names = list_builtin_providers()
         assert isinstance(names, list)
         assert len(names) > 0
@@ -29,6 +29,17 @@ class TestBuiltinProviders:
         assert "azure" in names
         assert "google" in names
         assert "bedrock" in names
+        assert "openrouter" in names
+        assert "local" in names
+        # "gemini" is an alias resolved via get_builtin_provider(); it is
+        # not a canonical name so it does not appear in the default list.
+        assert "gemini" not in names
+
+    def test_list_builtin_providers_with_aliases(self):
+        """Test listing built-in providers including alias names."""
+        names = list_builtin_providers(include_aliases=True)
+        assert "google" in names
+        assert "gemini" in names
 
     def test_list_is_sorted(self):
         """Test that the provider list is sorted."""
@@ -39,9 +50,11 @@ class TestBuiltinProviders:
         """Test getting all built-in provider configs."""
         providers = get_builtin_providers()
         assert isinstance(providers, dict)
+        # get_builtin_providers() returns canonical names only (no aliases)
         assert len(providers) == len(list_builtin_providers())
         for name, provider in providers.items():
             assert isinstance(provider, ProviderConfig)
+            # The provider's internal name must match its registry key
             assert provider.name == name
 
     def test_get_specific_builtin_provider(self):
@@ -173,6 +186,32 @@ class TestGoogleProvider:
 
 
 # ---------------------------------------------------------------------------
+# Google / Gemini alias tests
+# ---------------------------------------------------------------------------
+
+
+class TestGeminiAlias:
+    """Tests that 'gemini' works as an alias for the Google Gemini provider."""
+
+    def test_gemini_alias_resolves(self):
+        """Test that 'gemini' alias returns a valid provider config."""
+        p = get_builtin_provider("gemini")
+        assert p is not None
+
+    def test_gemini_alias_has_models(self):
+        """Test that gemini alias has models configured."""
+        p = get_builtin_provider("gemini")
+        assert len(p.models) > 0
+
+    def test_gemini_alias_is_separate_instance(self):
+        """Test that gemini and google return separate (but equivalent) instances."""
+        pg = get_builtin_provider("google")
+        pge = get_builtin_provider("gemini")
+        assert pg is not pge
+        assert pg.api_base == pge.api_base
+
+
+# ---------------------------------------------------------------------------
 # Bedrock provider tests
 # ---------------------------------------------------------------------------
 
@@ -186,6 +225,60 @@ class TestBedrockProvider:
         assert p.display_name == "AWS Bedrock"
         assert p.auth_type == AuthType.NONE  # uses AWS credentials
         assert "region" in p.extra
+
+
+# ---------------------------------------------------------------------------
+# OpenRouter provider tests
+# ---------------------------------------------------------------------------
+
+
+class TestOpenRouterProvider:
+    """Tests for the OpenRouter built-in provider."""
+
+    def test_basic_config(self):
+        """Test OpenRouter provider basic configuration."""
+        p = get_builtin_provider("openrouter")
+        assert p is not None
+        assert p.name == "openrouter"
+        assert p.display_name == "OpenRouter"
+        assert p.api_base == "https://openrouter.ai/api/v1"
+        assert p.api_key_env_var == "OPENROUTER_API_KEY"
+        assert p.auth_type == AuthType.BEARER_TOKEN
+
+    def test_has_models(self):
+        """Test that OpenRouter provider has models configured."""
+        p = get_builtin_provider("openrouter")
+        assert len(p.models) > 0
+
+    def test_has_claude_models(self):
+        """Test that OpenRouter includes Anthropic Claude models."""
+        p = get_builtin_provider("openrouter")
+        claude_models = [m for m in p.models if m.startswith("anthropic/")]
+        assert len(claude_models) > 0
+
+    def test_has_openai_models(self):
+        """Test that OpenRouter includes OpenAI models."""
+        p = get_builtin_provider("openrouter")
+        openai_models = [m for m in p.models if m.startswith("openai/")]
+        assert len(openai_models) > 0
+
+    def test_has_google_models(self):
+        """Test that OpenRouter includes Google models."""
+        p = get_builtin_provider("openrouter")
+        google_models = [m for m in p.models if m.startswith("google/")]
+        assert len(google_models) > 0
+
+    def test_default_model_in_models(self):
+        """Test that the default model is in the models list."""
+        p = get_builtin_provider("openrouter")
+        assert p.default_model in p.models
+
+    def test_is_fresh_instance(self):
+        """Test that each call returns a fresh instance."""
+        p1 = get_builtin_provider("openrouter")
+        p2 = get_builtin_provider("openrouter")
+        assert p1 is not p2
+        assert p1.name == p2.name
 
 
 # ---------------------------------------------------------------------------

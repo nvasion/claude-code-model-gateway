@@ -637,7 +637,9 @@ class TestConfigManagerEndToEnd:
         """Add a provider, add a model, save, reload — all changes survive."""
         path = tmp_path / "e2e.yaml"
 
-        mgr = ConfigManager.from_default()
+        # Start with an empty config so there are no pre-existing providers
+        # that could conflict with the ones we add below.
+        mgr = ConfigManager()
         mgr.add_provider(
             "local",
             api_base="http://localhost:11434/v1",
