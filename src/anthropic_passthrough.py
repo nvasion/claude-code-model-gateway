@@ -141,19 +141,53 @@ class ConnectionPool:
     def get_connection(self) -> http.client.HTTPConnection:
         """Get a connection from the pool or create a new one.
 
+        Connections are validated before being returned. A connection is
+        considered alive only when its underlying socket is present **and**
+        a non-blocking ``recv(1, MSG_PEEK)`` returns data or raises
+        ``BlockingIOError`` (meaning the socket is open but has no data).
+        Any other outcome (e.g. ``ConnectionResetError``, empty ``recv``
+        indicating EOF) means the remote closed the connection and the
+        pooled connection is discarded.
+
         Returns:
             An HTTP(S) connection to the upstream server.
         """
         with self._lock:
             while self._pool:
                 conn = self._pool.pop()
-                # Test if the connection is still alive
                 try:
-                    # A quick check — if the socket is closed, this will fail
-                    if conn.sock is not None:
-                        return conn
+                    if conn.sock is None:
+                        continue
+                    # Attempt a non-blocking peek to confirm the socket is
+                    # still open.  If the server closed the connection we'll
+                    # get either an empty bytes object (clean EOF) or an
+                    # OSError with errno other than EAGAIN/EWOULDBLOCK.
+                    conn.sock.setblocking(False)
+                    try:
+                        data = conn.sock.recv(1, socket.MSG_PEEK)
+                        if data == b"":
+                            # Remote end closed the connection (clean EOF).
+                            conn.close()
+                            continue
+                    except BlockingIOError:
+                        # No data available but socket is open — healthy.
+                        pass
+                    except OSError:
+                        # Any other socket error means the connection is dead.
+                        conn.close()
+                        continue
+                    finally:
+                        try:
+                            conn.sock.setblocking(True)
+                        except OSError:
+                            conn.close()
+                            continue
+                    return conn
                 except Exception:
-                    pass
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
 
         # Create a new connection
         return self._create_connection()
@@ -189,6 +223,11 @@ class ConnectionPool:
 
         Returns:
             A new HTTP(S) connection.
+
+        Note:
+            ``_created_count`` is incremented inside ``self._lock`` to
+            prevent a data race when multiple threads create connections
+            concurrently.
         """
         if self.use_https:
             context = ssl.create_default_context()
@@ -204,7 +243,8 @@ class ConnectionPool:
                 self.port,
                 timeout=self.timeout,
             )
-        self._created_count += 1
+        with self._lock:
+            self._created_count += 1
         return conn
 
     def close_all(self) -> None:
