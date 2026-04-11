@@ -5008,7 +5008,8 @@ def route_serve(
     if enabled_providers:
         for pname, prov in sorted(enabled_providers.items()):
             marker = " *" if pname == config.default_provider else "  "
-            click.echo(f"  {marker} {prov.display_name} ({pname}) -> {prov.api_base}")
+            model_info = f" [model: {prov.default_model}]" if prov.default_model else ""
+            click.echo(f"  {marker} {prov.display_name} ({pname}) -> {prov.api_base}{model_info}")
     click.echo(f"  Timeout:   {timeout}s")
     click.echo(f"  Retries:   {max_retries} (base delay: {retry_delay}s)")
     click.echo(f"  Rate limit:{f' {max_rpm} rpm/client' if max_rpm else ' disabled'}")

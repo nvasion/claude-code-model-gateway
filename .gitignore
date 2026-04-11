@@ -45,3 +45,6 @@ venv/
 *.pid
 .factory/
 .factory/worktrees/
+
+# Service Configuration
+gateway.yaml

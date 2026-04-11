@@ -78,6 +78,42 @@ from src.router import (
     extract_model_from_body,
     extract_model_from_path,
 )
+from src.translators.registry import get_registry
+
+
+# ---------------------------------------------------------------------------
+# Format detection helpers
+# ---------------------------------------------------------------------------
+
+#: Maps provider names to their native API format.
+_PROVIDER_FORMAT: Dict[str, str] = {
+    "anthropic": "anthropic",
+    "openai": "openai",
+    "openrouter": "openai",
+    "local": "openai",
+    "azure": "openai",
+    "google": "google",
+    "bedrock": "bedrock",
+}
+
+#: Maps incoming request paths to the API format they represent.
+_PATH_FORMAT: Dict[str, str] = {
+    "/v1/messages": "anthropic",
+    "/v1/chat/completions": "openai",
+}
+
+
+def _detect_source_format(path: str) -> str:
+    """Detect the API format of an incoming request from its path."""
+    for prefix, fmt in _PATH_FORMAT.items():
+        if path == prefix or path.startswith(prefix + "?"):
+            return fmt
+    return "unknown"
+
+
+def _get_provider_format(provider_name: str) -> str:
+    """Return the API format for a given provider."""
+    return _PROVIDER_FORMAT.get(provider_name, "openai")
 
 logger = get_logger("gateway")
 
@@ -401,6 +437,30 @@ class GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
         if intercept_result.modified_headers:
             upstream_headers.update(intercept_result.modified_headers)
 
+        # Safety net: ensure auth is always injected for the resolved provider.
+        # The auth interceptor runs before model routing, so if routing sets
+        # the provider late, auth headers may be missing.
+        if (
+            provider_config.api_key_env_var
+            and "Authorization" not in upstream_headers
+            and "x-api-key" not in upstream_headers
+        ):
+            import os as _os
+
+            _api_key = _os.environ.get(provider_config.api_key_env_var)
+            if _api_key:
+                from src.models import AuthType
+
+                if provider_config.auth_type == AuthType.BEARER_TOKEN:
+                    upstream_headers["Authorization"] = f"Bearer {_api_key}"
+                elif provider_config.auth_type == AuthType.API_KEY:
+                    upstream_headers["x-api-key"] = _api_key
+                logger.debug(
+                    "gateway: injected auth for provider %s from %s",
+                    provider_name,
+                    provider_config.api_key_env_var,
+                )
+
         # Use modified body if the interceptors updated it
         effective_body_dict = intercept_result.modified_body or body_dict
         effective_body_bytes: bytes = b""
@@ -408,6 +468,97 @@ class GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
             effective_body_bytes = json.dumps(effective_body_dict).encode("utf-8")
         elif body_bytes:
             effective_body_bytes = body_bytes
+
+        # ------------------------------------------------------------------ #
+        # Deduplicate model requests.
+        # Claude Code fires parallel/retry requests for the same prompt
+        # to multiple models.  When all route to the same backend, the
+        # user sees duplicate output.  Dedup by hashing the last user
+        # message — if the same content was forwarded within 30s, drop it.
+        # Only applies to POST /v1/messages.
+        # ------------------------------------------------------------------ #
+        if method == "POST" and "/messages" in path and effective_body_dict:
+            import hashlib as _hashlib
+
+            _dedup_lock = getattr(self.__class__, "_dedup_lock", None)
+            if _dedup_lock is None:
+                import threading as _threading
+                self.__class__._dedup_lock = _threading.Lock()
+                self.__class__._dedup_cache: Dict[str, float] = {}
+                _dedup_lock = self.__class__._dedup_lock
+
+            # Hash the last user message for dedup key
+            messages = effective_body_dict.get("messages", [])
+            last_user_msg = ""
+            for msg in reversed(messages):
+                if msg.get("role") == "user":
+                    content = msg.get("content", "")
+                    if isinstance(content, str):
+                        last_user_msg = content
+                    elif isinstance(content, list):
+                        last_user_msg = str(content)
+                    break
+            dedup_key = _hashlib.md5(last_user_msg.encode()).hexdigest()
+
+            with _dedup_lock:
+                now = time.time()
+                # Clean old entries
+                self.__class__._dedup_cache = {
+                    k: v for k, v in self.__class__._dedup_cache.items()
+                    if now - v < 30.0
+                }
+                if dedup_key in self.__class__._dedup_cache:
+                    logger.debug(
+                        "gateway: dropping duplicate request (%s) — same message within 30s",
+                        ctx.model or "",
+                    )
+                    self._send_error_response(529, "overloaded", "Model temporarily unavailable")
+                    return
+                self.__class__._dedup_cache[dedup_key] = now
+
+        # ------------------------------------------------------------------ #
+        # Format translation (Anthropic ↔ OpenAI bridging)
+        # ------------------------------------------------------------------ #
+        source_format = _detect_source_format(path)
+        target_format = _get_provider_format(provider_name)
+        needs_translation = (
+            source_format != "unknown"
+            and target_format != "unknown"
+            and source_format != target_format
+        )
+
+        if needs_translation and effective_body_dict is not None:
+            try:
+                effective_body_dict, path = self._translate_request(
+                    effective_body_dict,
+                    source_format=source_format,
+                    target_format=target_format,
+                    target_model=provider_config.default_model,
+                )
+                effective_body_bytes = json.dumps(effective_body_dict).encode("utf-8")
+                logger.info(
+                    "gateway: translated request %s → %s (model=%s)",
+                    source_format,
+                    target_format,
+                    provider_config.default_model,
+                )
+            except Exception as exc:
+                logger.error("gateway: request translation failed: %s", exc)
+                self._send_error_response(
+                    500, "translation_error", f"Request format translation failed: {exc}"
+                )
+                if self.stats:
+                    self.stats.record_error()
+                return
+
+        # Store translation context for response handling
+        self._translation_ctx = {
+            "needs_translation": needs_translation,
+            "source_format": source_format,
+            "target_format": target_format,
+            "model": provider_config.default_model,
+            "is_streaming": effective_body_dict.get("stream", False) if effective_body_dict else False,
+        } if needs_translation else None
 
         # ------------------------------------------------------------------ #
         # Build upstream target URL
@@ -429,9 +580,13 @@ class GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
             upstream_headers.pop("Content-Length", None)
 
         # Forward select client headers that are safe to pass through
-        for header_name in ("anthropic-version", "accept", "user-agent"):
+        for header_name in ("accept", "user-agent"):
             if header_name in headers and header_name not in upstream_headers:
                 upstream_headers[header_name] = headers[header_name]
+        # Only forward anthropic-version if NOT translating to a different format
+        if not needs_translation:
+            if "anthropic-version" in headers and "anthropic-version" not in upstream_headers:
+                upstream_headers["anthropic-version"] = headers["anthropic-version"]
 
         # ------------------------------------------------------------------ #
         # Forward to upstream (with retry)
@@ -469,11 +624,19 @@ class GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
                 exc,
             )
             status = exc.context.status_code if exc.context else 502
-            self._send_error_response(
-                status or 502,
-                "gateway_error",
-                str(exc),
-            )
+            try:
+                self._send_error_response(
+                    status or 502,
+                    "gateway_error",
+                    str(exc),
+                )
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                logger.debug("gateway: client disconnected before error response")
+            if self.stats:
+                self.stats.record_error()
+
+        except (BrokenPipeError, ConnectionResetError):
+            logger.debug("gateway: client disconnected during forwarding")
             if self.stats:
                 self.stats.record_error()
 
@@ -484,7 +647,10 @@ class GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
                 exc,
                 exc_info=True,
             )
-            self._send_error_response(500, "internal_error", str(exc))
+            try:
+                self._send_error_response(500, "internal_error", str(exc))
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                logger.debug("gateway: client disconnected before error response")
             if self.stats:
                 self.stats.record_error()
 
@@ -552,6 +718,247 @@ class GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
             )
             from src.interceptor import InterceptResult, InterceptAction
             return InterceptResult(action=InterceptAction.SKIP)
+
+    # ------------------------------------------------------------------ #
+    # Format translation helpers
+    # ------------------------------------------------------------------ #
+
+    def _translate_request(
+        self,
+        body: Dict[str, Any],
+        *,
+        source_format: str,
+        target_format: str,
+        target_model: str,
+    ) -> Tuple[Dict[str, Any], str]:
+        """Translate a request body and return (translated_body, new_path).
+
+        Currently supports: anthropic → openai.
+
+        Args:
+            body: Parsed request body dict.
+            source_format: Source API format (e.g. 'anthropic').
+            target_format: Target API format (e.g. 'openai').
+            target_model: Model name to use in the translated request.
+
+        Returns:
+            Tuple of (translated body dict, new URL path).
+        """
+        if source_format == "anthropic" and target_format == "openai":
+            from src.translators.anthropic import AnthropicTranslator
+
+            translator = AnthropicTranslator()
+            canonical = translator.parse_request(body, model=target_model)
+            # Force non-streaming from upstream — we'll wrap the JSON response
+            # as Anthropic SSE ourselves.  This avoids streaming translation
+            # issues and gives us full control over the SSE format.
+            canonical["stream"] = False
+            # Return /chat/completions (not /v1/chat/completions) because
+            # provider api_base already includes the /v1 prefix
+            # e.g. https://openrouter.ai/api/v1 + /chat/completions
+            return canonical, "/chat/completions"
+
+        # Add more format bridges here as needed
+        raise ValueError(f"Unsupported translation: {source_format} → {target_format}")
+
+    def _translate_response_body(
+        self,
+        resp_body: bytes,
+        translation_ctx: Dict[str, Any],
+    ) -> bytes:
+        """Translate a non-streaming response body back to source format.
+
+        Args:
+            resp_body: Raw upstream response bytes.
+            translation_ctx: Translation context from the request phase.
+
+        Returns:
+            Translated response bytes.
+        """
+        source_format = translation_ctx["source_format"]
+        target_format = translation_ctx["target_format"]
+        model = translation_ctx.get("model", "")
+
+        if source_format == "anthropic" and target_format == "openai":
+            from src.translators.anthropic import AnthropicTranslator
+
+            try:
+                openai_resp = json.loads(resp_body.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return resp_body  # Can't translate, return as-is
+
+            translator = AnthropicTranslator()
+            anthropic_resp = translator.format_response(openai_resp, model=model)
+            return json.dumps(anthropic_resp).encode("utf-8")
+
+        return resp_body
+
+    def _relay_streaming_translated(
+        self,
+        response: http.client.HTTPResponse,
+        translation_ctx: Dict[str, Any],
+    ) -> None:
+        """Stream response with format translation (e.g. OpenAI SSE → Anthropic SSE).
+
+        Buffers incoming SSE events, translates each to the source format,
+        and re-emits to the client.
+
+        Args:
+            response: Upstream HTTP response.
+            translation_ctx: Translation context from the request phase.
+        """
+        from src.translators.anthropic import AnthropicTranslator
+
+        translator = AnthropicTranslator()
+        model = translation_ctx.get("model", "")
+        is_first = True
+        sent_message_stop = False
+        buffer = b""
+
+        def _emit(event_text: str) -> bool:
+            """Write an SSE event string; return False if client disconnected."""
+            try:
+                self.wfile.write(event_text.encode("utf-8"))
+                self.wfile.flush()
+                return True
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return False
+
+        def _process_payload(payload: str) -> bool:
+            """Process a single SSE data payload. Returns False to stop."""
+            nonlocal is_first, sent_message_stop
+
+            if payload.strip() == "[DONE]":
+                # Ensure message_stop was sent
+                if not sent_message_stop:
+                    stop_event = 'event: message_stop\ndata: {"type": "message_stop"}\n\n'
+                    sent_message_stop = True
+                    return _emit(stop_event)
+                return True
+
+            try:
+                chunk = json.loads(payload)
+            except json.JSONDecodeError:
+                return True
+
+            events = translator.format_sse_events(
+                chunk, model=model, is_first=is_first
+            )
+            is_first = False
+
+            for event_text in events:
+                if "message_stop" in event_text:
+                    sent_message_stop = True
+                if not _emit(event_text):
+                    return False
+            return True
+
+        try:
+            while True:
+                data = response.read(4096)
+                if not data:
+                    break
+                buffer += data
+
+                # Parse complete SSE events (delimited by double newline)
+                while b"\n\n" in buffer:
+                    event_raw, buffer = buffer.split(b"\n\n", 1)
+                    event_str = event_raw.decode("utf-8", errors="replace").strip()
+                    if not event_str:
+                        continue
+
+                    # Extract "data:" payload from SSE lines
+                    for line in event_str.split("\n"):
+                        line = line.strip()
+                        if line.startswith("data: "):
+                            if not _process_payload(line[6:]):
+                                return
+                        elif line.startswith("data:"):
+                            if not _process_payload(line[5:]):
+                                return
+
+            # Process any remaining data in buffer
+            remaining = buffer.decode("utf-8", errors="replace").strip()
+            if remaining:
+                for line in remaining.split("\n"):
+                    line = line.strip()
+                    if line.startswith("data: "):
+                        _process_payload(line[6:])
+                    elif line.startswith("data:"):
+                        _process_payload(line[5:])
+
+            # Always ensure stream is properly terminated
+            if not sent_message_stop:
+                _emit('event: message_stop\ndata: {"type": "message_stop"}\n\n')
+
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            logger.debug("gateway: client disconnected during streaming")
+        except Exception as exc:
+            logger.debug("gateway: translated streaming relay ended: %s", exc)
+
+    def _emit_json_as_sse(
+        self,
+        resp_body: bytes,
+        translation_ctx: Dict[str, Any],
+    ) -> None:
+        """Convert a non-streaming OpenAI JSON response to Anthropic SSE events.
+
+        Used when the client requested streaming but the upstream returned a
+        plain JSON response.  Emits a complete set of Anthropic SSE events
+        (message_start → content_block_start → content_block_delta →
+        content_block_stop → message_delta → message_stop).
+        """
+        from src.translators.anthropic import AnthropicTranslator
+
+        model = translation_ctx.get("model", "")
+
+        try:
+            openai_resp = json.loads(resp_body.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            logger.warning("gateway: could not parse upstream JSON for SSE wrapping")
+            return
+
+        translator = AnthropicTranslator()
+        anthropic_resp = translator.format_response(openai_resp, model=model)
+
+        # Extract the text content
+        text = ""
+        for block in anthropic_resp.get("content", []):
+            if block.get("type") == "text":
+                text += block.get("text", "")
+
+        msg_id = anthropic_resp.get("id", "msg_unknown")
+        stop_reason = anthropic_resp.get("stop_reason", "end_turn")
+        usage = anthropic_resp.get("usage", {})
+
+        def _write(s: str) -> None:
+            try:
+                self.wfile.write(s.encode("utf-8"))
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                raise
+
+        try:
+            # message_start
+            _write(f'event: message_start\ndata: {json.dumps({"type": "message_start", "message": {"id": msg_id, "type": "message", "role": "assistant", "content": [], "model": model, "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": usage.get("input_tokens", 0), "output_tokens": 0}}})}\n\n')
+
+            # content_block_start
+            _write(f'event: content_block_start\ndata: {json.dumps({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})}\n\n')
+
+            # content_block_delta — send full text in one delta
+            _write(f'event: content_block_delta\ndata: {json.dumps({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}})}\n\n')
+
+            # content_block_stop
+            _write(f'event: content_block_stop\ndata: {json.dumps({"type": "content_block_stop", "index": 0})}\n\n')
+
+            # message_delta
+            _write(f'event: message_delta\ndata: {json.dumps({"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": None}, "usage": {"output_tokens": usage.get("output_tokens", 0)}})}\n\n')
+
+            # message_stop
+            _write(f'event: message_stop\ndata: {json.dumps({"type": "message_stop"})}\n\n')
+
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            logger.debug("gateway: client disconnected during JSON-to-SSE emit")
 
     def _build_upstream_url(self, provider: ProviderConfig, path: str) -> str:
         """Construct the full upstream URL for a given provider and request path.
@@ -693,24 +1100,68 @@ class GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
             status = response.status
             reason = response.reason or ""
             is_streaming = self._is_streaming_response(response)
+            translation_ctx = getattr(self, "_translation_ctx", None)
 
-            # Send status line and headers to client
-            self.send_response(status, reason)
-            for header_name, header_val in response.getheaders():
-                name_lower = header_name.lower()
-                if name_lower in HOP_BY_HOP_HEADERS:
-                    continue
-                self.send_header(header_name, header_val)
+            if translation_ctx and translation_ctx["needs_translation"] and status < 400:
+                # ---- Translated response path ---- #
+                client_wants_stream = translation_ctx.get("is_streaming", False)
+                # Only treat as SSE if Content-Type says so (not just chunked encoding)
+                content_type = response.getheader("Content-Type", "")
+                is_actual_sse = "text/event-stream" in content_type
 
-            self.end_headers()
+                logger.debug(
+                    "gateway: response path — is_actual_sse=%s, client_wants_stream=%s, "
+                    "content_type=%s, transfer_encoding=%s",
+                    is_actual_sse,
+                    client_wants_stream,
+                    content_type,
+                    response.getheader("Transfer-Encoding", ""),
+                )
 
-            # Relay body
-            if is_streaming:
-                self._relay_streaming(response)
+                if is_actual_sse:
+                    # Upstream is truly streaming SSE — translate events
+                    self.send_response(status, reason)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "keep-alive")
+                    self.end_headers()
+                    self._relay_streaming_translated(response, translation_ctx)
+                elif client_wants_stream:
+                    # Client requested streaming but upstream returned JSON.
+                    # Wrap the JSON response as Anthropic SSE events so
+                    # Claude Code doesn't get confused.
+                    resp_body = response.read()
+                    self.send_response(status, reason)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "keep-alive")
+                    self.end_headers()
+                    self._emit_json_as_sse(resp_body, translation_ctx)
+                else:
+                    resp_body = response.read()
+                    translated = self._translate_response_body(resp_body, translation_ctx)
+                    self.send_response(status, reason)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(translated)))
+                    self.end_headers()
+                    self.wfile.write(translated)
             else:
-                resp_body = response.read()
-                if resp_body:
-                    self.wfile.write(resp_body)
+                # ---- Raw passthrough (original behavior) ---- #
+                self.send_response(status, reason)
+                for header_name, header_val in response.getheaders():
+                    name_lower = header_name.lower()
+                    if name_lower in HOP_BY_HOP_HEADERS:
+                        continue
+                    self.send_header(header_name, header_val)
+
+                self.end_headers()
+
+                if is_streaming:
+                    self._relay_streaming(response)
+                else:
+                    resp_body = response.read()
+                    if resp_body:
+                        self.wfile.write(resp_body)
 
             # Check for provider errors (non-retryable logged only)
             if status >= 400:

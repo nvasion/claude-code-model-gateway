@@ -1,0 +1,38 @@
+# gateway-test.yaml
+# Test config: route all Claude Code traffic through OpenRouter → Qwen3-Coder (free)
+#
+# Usage:
+#   Terminal 1: claude-code-model-gateway gateway --config gateway-test.yaml --verbose
+#   Terminal 2: ANTHROPIC_BASE_URL=http://127.0.0.1:8080 claude
+
+default_provider: openrouter
+log_level: debug
+timeout: 120
+max_retries: 2
+
+providers:
+  openrouter:
+    name: openrouter
+    api_base: https://openrouter.ai/api/v1
+    api_key_env_var: OPENROUTER_API_KEY
+    auth_type: bearer_token
+    default_model: nvidia/nemotron-3-super-120b-a12b:free
+    enabled: true
+    display_name: OpenRouter
+    models:
+      nvidia/nemotron-3-super-120b-a12b:free:
+        name: "nvidia/nemotron-3-super-120b-a12b:free"
+        display_name: "Nemotron 3 Super (Free)"
+        max_tokens: 16384
+        supports_streaming: true
+        supports_tools: true
+        supports_vision: false
+
+extra:
+  routing_rules:
+    - pattern: "*"
+      provider: openrouter
+      rule_type: model_pattern
+      priority: 0
+      weight: 1
+      enabled: true
