@@ -633,6 +633,367 @@ class AnthropicTranslator(BaseTranslator):
             ],
         }  # type: ignore[return-value]
 
+    # ================================================================== #
+    # Reverse translation: Anthropic → Canonical (for gateway bridging)
+    # ================================================================== #
+
+    def parse_request(
+        self,
+        anthropic_request: Dict[str, Any],
+        *,
+        model: Optional[str] = None,
+    ) -> CanonicalRequest:
+        """Convert an incoming Anthropic Messages request to canonical (OpenAI) format.
+
+        This is the reverse of :meth:`translate_request`.  Used by the gateway
+        when Claude Code sends an Anthropic-format request that must be forwarded
+        to an OpenAI-compatible provider.
+
+        Args:
+            anthropic_request: Anthropic Messages API request body.
+            model: Optional model name override.
+
+        Returns:
+            Canonical (OpenAI Chat Completions) request dict.
+        """
+        messages: List[Dict[str, Any]] = []
+
+        # system → system message
+        system = anthropic_request.get("system")
+        if system:
+            if isinstance(system, str):
+                messages.append({"role": "system", "content": system})
+            elif isinstance(system, list):
+                text = self._extract_text_content(system)
+                if text:
+                    messages.append({"role": "system", "content": text})
+
+        # Convert Anthropic messages → canonical
+        for msg in anthropic_request.get("messages", []):
+            converted = self._reverse_convert_message(msg)
+            messages.extend(converted)
+
+        canonical: Dict[str, Any] = {
+            "model": model or anthropic_request.get("model", ""),
+            "messages": messages,
+        }
+
+        if "max_tokens" in anthropic_request:
+            canonical["max_tokens"] = anthropic_request["max_tokens"]
+        if "temperature" in anthropic_request:
+            canonical["temperature"] = anthropic_request["temperature"]
+        if "top_p" in anthropic_request:
+            canonical["top_p"] = anthropic_request["top_p"]
+
+        stop_sequences = anthropic_request.get("stop_sequences")
+        if stop_sequences:
+            canonical["stop"] = stop_sequences
+
+        if anthropic_request.get("stream"):
+            canonical["stream"] = True
+
+        tools = anthropic_request.get("tools")
+        if tools:
+            canonical["tools"] = self._reverse_convert_tools(tools)
+
+        tool_choice = anthropic_request.get("tool_choice")
+        if tool_choice is not None:
+            canonical["tool_choice"] = self._reverse_convert_tool_choice(tool_choice)
+
+        return canonical  # type: ignore[return-value]
+
+    def format_response(
+        self,
+        canonical_response: Dict[str, Any],
+        *,
+        model: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Convert a canonical (OpenAI) response to Anthropic Messages format.
+
+        This is the reverse of :meth:`translate_response`.  Used by the gateway
+        when an OpenAI-compatible provider responds and the result must be
+        returned to Claude Code in Anthropic format.
+
+        Args:
+            canonical_response: OpenAI Chat Completions response dict.
+            model: Optional model name override.
+
+        Returns:
+            Anthropic Messages API response dict.
+        """
+        choice = {}
+        choices = canonical_response.get("choices") or []
+        if choices:
+            choice = choices[0]
+
+        message = choice.get("message") or {}
+        content_blocks: List[Dict[str, Any]] = []
+
+        # Text content
+        text = message.get("content")
+        if text:
+            content_blocks.append({"type": "text", "text": text})
+
+        # Tool calls → tool_use blocks
+        for tc in message.get("tool_calls") or []:
+            fn = tc.get("function") or {}
+            arguments_raw = fn.get("arguments", "{}")
+            try:
+                input_data = json.loads(arguments_raw) if arguments_raw else {}
+            except (json.JSONDecodeError, TypeError):
+                input_data = {}
+            content_blocks.append({
+                "type": "tool_use",
+                "id": tc.get("id", self._make_response_id("toolu")),
+                "name": fn.get("name", ""),
+                "input": input_data,
+            })
+
+        # finish_reason → stop_reason (reverse map)
+        finish_reason = choice.get("finish_reason", "stop")
+        reverse_stop_map = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
+        stop_reason = reverse_stop_map.get(finish_reason, "end_turn")
+
+        # Usage
+        usage_raw = canonical_response.get("usage") or {}
+        usage = {
+            "input_tokens": usage_raw.get("prompt_tokens", 0),
+            "output_tokens": usage_raw.get("completion_tokens", 0),
+        }
+
+        return {
+            "id": canonical_response.get("id", self._make_response_id("msg")),
+            "type": "message",
+            "role": "assistant",
+            "content": content_blocks,
+            "model": model or canonical_response.get("model", ""),
+            "stop_reason": stop_reason,
+            "stop_sequence": None,
+            "usage": usage,
+        }
+
+    def format_sse_events(
+        self,
+        canonical_chunk: Dict[str, Any],
+        *,
+        model: Optional[str] = None,
+        is_first: bool = False,
+    ) -> List[str]:
+        """Convert a canonical (OpenAI) stream chunk to Anthropic SSE event strings.
+
+        Args:
+            canonical_chunk: OpenAI Chat Completions stream chunk dict.
+            model: Model name for the message.
+            is_first: Whether this is the first chunk (emits message_start).
+
+        Returns:
+            List of SSE event strings (each is ``"event: ...\\ndata: ...\\n\\n"``).
+        """
+        events: List[str] = []
+        choice = {}
+        choices = canonical_chunk.get("choices") or []
+        if choices:
+            choice = choices[0]
+
+        delta = choice.get("delta") or {}
+        finish_reason = choice.get("finish_reason")
+        model_name = model or canonical_chunk.get("model", "")
+        msg_id = canonical_chunk.get("id", self._make_response_id("msg"))
+
+        if is_first:
+            # Emit message_start
+            msg_start = {
+                "type": "message_start",
+                "message": {
+                    "id": msg_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": model_name,
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                },
+            }
+            events.append(f"event: message_start\ndata: {json.dumps(msg_start)}\n\n")
+
+            # Emit content_block_start for text
+            block_start = {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            }
+            events.append(f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n")
+
+        # Text delta
+        text = delta.get("content")
+        if text:
+            block_delta = {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": text},
+            }
+            events.append(f"event: content_block_delta\ndata: {json.dumps(block_delta)}\n\n")
+
+        # Tool call start
+        tool_calls = delta.get("tool_calls") or []
+        for tc in tool_calls:
+            tc_index = tc.get("index", 0)
+            if "id" in tc and tc.get("function", {}).get("name"):
+                # New tool call start
+                tb_start = {
+                    "type": "content_block_start",
+                    "index": tc_index + 1,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": tc["id"],
+                        "name": tc["function"]["name"],
+                        "input": {},
+                    },
+                }
+                events.append(f"event: content_block_start\ndata: {json.dumps(tb_start)}\n\n")
+            elif tc.get("function", {}).get("arguments"):
+                # Tool argument delta
+                arg_delta = {
+                    "type": "content_block_delta",
+                    "index": tc_index + 1,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": tc["function"]["arguments"],
+                    },
+                }
+                events.append(f"event: content_block_delta\ndata: {json.dumps(arg_delta)}\n\n")
+
+        # Finish
+        if finish_reason is not None:
+            reverse_stop_map = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
+            stop_reason = reverse_stop_map.get(finish_reason, "end_turn")
+
+            # content_block_stop
+            block_stop = {"type": "content_block_stop", "index": 0}
+            events.append(f"event: content_block_stop\ndata: {json.dumps(block_stop)}\n\n")
+
+            # message_delta with stop_reason
+            usage_raw = canonical_chunk.get("usage") or {}
+            msg_delta = {
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                "usage": {"output_tokens": usage_raw.get("completion_tokens", 0)},
+            }
+            events.append(f"event: message_delta\ndata: {json.dumps(msg_delta)}\n\n")
+
+            # message_stop
+            events.append(f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n")
+
+        return events
+
+    # -- Reverse helpers (Anthropic → Canonical) ----------------------------- #
+
+    def _reverse_convert_message(
+        self, msg: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """Convert an Anthropic message to one or more canonical messages."""
+        role = msg.get("role", "")
+        content = msg.get("content")
+        results: List[Dict[str, Any]] = []
+
+        if role == "user":
+            if isinstance(content, str):
+                results.append({"role": "user", "content": content})
+            elif isinstance(content, list):
+                tool_results = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"]
+                other_blocks = [b for b in content if isinstance(b, dict) and b.get("type") != "tool_result"]
+
+                # Tool results → tool messages
+                for tr in tool_results:
+                    results.append({
+                        "role": "tool",
+                        "tool_call_id": tr.get("tool_use_id", ""),
+                        "content": tr.get("content", ""),
+                    })
+
+                # Other content blocks → user message
+                if other_blocks:
+                    canonical_parts: List[Dict[str, Any]] = []
+                    for block in other_blocks:
+                        btype = block.get("type")
+                        if btype == "text":
+                            canonical_parts.append({"type": "text", "text": block.get("text", "")})
+                        elif btype == "image":
+                            source = block.get("source") or {}
+                            if source.get("type") == "base64":
+                                mt = source.get("media_type", "image/png")
+                                data = source.get("data", "")
+                                url = f"data:{mt};base64,{data}"
+                            else:
+                                url = source.get("url", "")
+                            canonical_parts.append({"type": "image_url", "image_url": {"url": url}})
+                    if canonical_parts:
+                        results.append({"role": "user", "content": canonical_parts})
+
+        elif role == "assistant":
+            msg_dict: Dict[str, Any] = {"role": "assistant"}
+            if isinstance(content, str):
+                msg_dict["content"] = content
+            elif isinstance(content, list):
+                text_parts: List[str] = []
+                tool_calls: List[Dict[str, Any]] = []
+                for block in content:
+                    btype = block.get("type")
+                    if btype == "text":
+                        text_parts.append(block.get("text", ""))
+                    elif btype == "tool_use":
+                        input_data = block.get("input") or {}
+                        try:
+                            args = json.dumps(input_data)
+                        except (TypeError, ValueError):
+                            args = "{}"
+                        tool_calls.append({
+                            "id": block.get("id", ""),
+                            "type": "function",
+                            "function": {"name": block.get("name", ""), "arguments": args},
+                        })
+                msg_dict["content"] = "\n".join(text_parts) if text_parts else None
+                if tool_calls:
+                    msg_dict["tool_calls"] = tool_calls
+            else:
+                msg_dict["content"] = content
+            results.append(msg_dict)
+
+        return results
+
+    def _reverse_convert_tools(
+        self, tools: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Convert Anthropic tools to canonical (OpenAI) format."""
+        result: List[Dict[str, Any]] = []
+        for tool in tools:
+            result.append({
+                "type": "function",
+                "function": {
+                    "name": tool.get("name", ""),
+                    "description": tool.get("description", ""),
+                    "parameters": tool.get("input_schema") or {"type": "object", "properties": {}},
+                },
+            })
+        return result
+
+    def _reverse_convert_tool_choice(self, tool_choice: Any) -> Any:
+        """Convert Anthropic tool_choice to canonical (OpenAI) format."""
+        if not isinstance(tool_choice, dict):
+            return "auto"
+        tc_type = tool_choice.get("type", "auto")
+        if tc_type == "auto":
+            return "auto"
+        if tc_type == "none":
+            return "none"
+        if tc_type == "any":
+            return "required"
+        if tc_type == "tool":
+            name = tool_choice.get("name", "")
+            return {"type": "function", "function": {"name": name}}
+        return "auto"
+
     def _make_tool_arg_chunk(
         self,
         partial_json: str,
